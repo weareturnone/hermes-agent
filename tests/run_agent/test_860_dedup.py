@@ -98,6 +98,37 @@ class TestFlushDeduplication:
             rows = db.get_messages(agent.session_id)
             assert len(rows) == 3, f"Expected 3 total messages, got {len(rows)}"
 
+    def test_flush_compacts_large_tool_output_before_db_persistence(self, monkeypatch):
+        """Agent direct DB flush must not bypass gateway tool-output compaction."""
+        from hermes_state import SessionDB
+
+        monkeypatch.setenv("HERMES_PERSISTED_TOOL_OUTPUT_MAX_CHARS", "1024")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+            agent = self._make_agent(db)
+
+            raw = "x" * 2048
+            messages = [
+                {
+                    "role": "tool",
+                    "content": raw,
+                    "tool_name": "terminal",
+                    "tool_call_id": "call_large",
+                },
+            ]
+
+            agent._flush_messages_to_session_db(messages, [])
+
+            rows = db.get_messages_as_conversation(agent.session_id)
+            assert len(rows) == 1
+            assert raw not in rows[0]["content"]
+            assert '"original_char_size": 2048' in rows[0]["content"]
+            assert '"threshold_char_size": 1024' in rows[0]["content"]
+            assert rows[0]["tool_name"] == "terminal"
+            assert rows[0]["tool_call_id"] == "call_large"
+
     def test_persist_session_multiple_calls_no_duplication(self):
         """Multiple _persist_session calls don't duplicate DB entries."""
         from hermes_state import SessionDB
