@@ -636,6 +636,7 @@ from gateway.session import (
     build_session_context,
     build_session_context_prompt,
     build_session_key,
+    compact_large_tool_result_for_persistence,
     is_shared_multi_user_session,
 )
 from gateway.delivery import DeliveryRouter
@@ -11872,6 +11873,10 @@ class GatewayRunner:
         # Copy conversation history to the new session
         for msg in history:
             try:
+                msg = compact_large_tool_result_for_persistence(
+                    msg,
+                    session_id=new_session_id,
+                )
                 self._session_db.append_message(
                     session_id=new_session_id,
                     role=msg.get("role", "user"),
