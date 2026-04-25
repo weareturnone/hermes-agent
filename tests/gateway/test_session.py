@@ -545,8 +545,89 @@ class TestSessionStoreRewriteTranscript:
         assert reloaded == []
 
 
+class TestSessionStoreToolResultCompaction:
+    # Large tool outputs should not be written raw into state.db.
+
+    @pytest.fixture()
+    def store(self, tmp_path, monkeypatch):
+        import hermes_state
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        config = GatewayConfig()
+        return SessionStore(sessions_dir=tmp_path, config=config)
+
+    def test_large_tool_output_compacted_before_sqlite_persistence(self, store, monkeypatch, caplog):
+        monkeypatch.setenv("HERMES_PERSISTED_TOOL_OUTPUT_MAX_CHARS", "1024")
+        caplog.set_level("INFO", logger="gateway.session")
+
+        session_id = "large_tool_sqlite"
+        store._db.create_session(session_id=session_id, source="telegram")
+        raw = "x" * 2048
+        store.append_to_transcript(
+            session_id,
+            {
+                "role": "tool",
+                "content": raw,
+                "tool_name": "terminal",
+                "tool_call_id": "call_123",
+                "timestamp": "2026-04-25T00:00:00",
+            },
+        )
+
+        rows = store._db.get_messages_as_conversation(session_id)
+        assert len(rows) == 1
+        persisted = rows[0]["content"]
+        assert raw not in persisted
+        assert "Hermes compacted persisted tool result" in persisted
+        assert "\"original_char_size\": 2048" in persisted
+        assert "\"threshold_char_size\": 1024" in persisted
+        assert "\"tool_name\": \"terminal\"" in persisted
+        assert "\"tool_call_id\": \"call_123\"" in persisted
+        assert rows[0]["tool_name"] == "terminal"
+        assert rows[0]["tool_call_id"] == "call_123"
+        assert any("Compacted persisted tool result" in r.message for r in caplog.records)
+
+    def test_small_tool_output_remains_exact(self, store, monkeypatch):
+        monkeypatch.setenv("HERMES_PERSISTED_TOOL_OUTPUT_MAX_CHARS", "1024")
+
+        session_id = "small_tool_sqlite"
+        store._db.create_session(session_id=session_id, source="telegram")
+        raw = "small tool output"
+        store.append_to_transcript(
+            session_id,
+            {
+                "role": "tool",
+                "content": raw,
+                "tool_name": "search",
+                "tool_call_id": "call_small",
+            },
+        )
+
+        rows = store._db.get_messages_as_conversation(session_id)
+        assert len(rows) == 1
+        assert rows[0]["content"] == raw
+        assert rows[0]["tool_name"] == "search"
+        assert rows[0]["tool_call_id"] == "call_small"
+
+    def test_rewrite_transcript_compacts_large_tool_output(self, store, monkeypatch):
+        monkeypatch.setenv("HERMES_PERSISTED_TOOL_OUTPUT_MAX_CHARS", "1024")
+
+        session_id = "rewrite_large_tool"
+        store._db.create_session(session_id=session_id, source="telegram")
+        raw = "z" * 2048
+        store.rewrite_transcript(
+            session_id,
+            [{"role": "tool", "content": raw, "tool_name": "read_file"}],
+        )
+
+        rows = store._db.get_messages_as_conversation(session_id)
+        assert len(rows) == 1
+        assert raw not in rows[0]["content"]
+        assert "\"original_char_size\": 2048" in rows[0]["content"]
+        assert rows[0]["tool_name"] == "read_file"
+
+
 class TestLoadTranscriptDBOnly:
-    """After spec 002, load_transcript reads only from state.db."""
+    # After spec 002, load_transcript reads only from state.db.
 
     def test_db_only_returns_empty_for_nonexistent(self, tmp_path, monkeypatch):
         import hermes_state
