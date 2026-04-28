@@ -492,6 +492,7 @@ AUTHOR_MAP = {
     "marco@rutimka.de": "Marco Rutsch",
     "paul@gamma.app": "Paul Bergeron",
     "zhangxicen@example.com": "zhangxicen",
+    "codex@openai.com": "codex",
     "codex@openai.invalid": "teknium1",
     "screenmachine@gmail.com": "teknium1",
 }

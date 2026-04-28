@@ -443,6 +443,108 @@ class TestSessionStoreRewriteTranscript:
         assert reloaded == []
 
 
+class TestSessionStoreToolResultCompaction:
+    """Large tool outputs should not be written raw into gateway transcripts."""
+
+    @pytest.fixture()
+    def store(self, tmp_path):
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            s = SessionStore(sessions_dir=tmp_path, config=config)
+        s._db = None
+        s._loaded = True
+        return s
+
+    def test_large_tool_output_compacted_before_jsonl_persistence(
+        self, store, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("HERMES_PERSISTED_TOOL_OUTPUT_MAX_CHARS", "1024")
+        caplog.set_level("INFO", logger="gateway.session")
+
+        session_id = "large_tool_jsonl"
+        raw = "x" * 2048
+        store.append_to_transcript(
+            session_id,
+            {
+                "role": "tool",
+                "content": raw,
+                "tool_name": "terminal",
+                "tool_call_id": "call_123",
+                "timestamp": "2026-04-25T00:00:00",
+            },
+        )
+
+        reloaded = store.load_transcript(session_id)
+        assert len(reloaded) == 1
+        persisted = reloaded[0]["content"]
+        assert raw not in persisted
+        assert "Hermes compacted persisted tool result" in persisted
+        assert '"original_char_size": 2048' in persisted
+        assert '"threshold_char_size": 1024' in persisted
+        assert '"tool_name": "terminal"' in persisted
+        assert '"tool_call_id": "call_123"' in persisted
+        assert any("Compacted persisted tool result" in r.message for r in caplog.records)
+
+    def test_small_tool_output_remains_exact(self, store, monkeypatch):
+        monkeypatch.setenv("HERMES_PERSISTED_TOOL_OUTPUT_MAX_CHARS", "1024")
+
+        session_id = "small_tool_jsonl"
+        raw = "small tool output"
+        msg = {
+            "role": "tool",
+            "content": raw,
+            "tool_name": "search",
+            "tool_call_id": "call_small",
+        }
+        store.append_to_transcript(session_id, msg)
+
+        assert store.load_transcript(session_id) == [msg]
+
+    def test_existing_raw_session_records_still_load(self, store):
+        session_id = "legacy_raw_tool"
+        raw = "legacy raw tool output " * 100
+        transcript_path = store.get_transcript_path(session_id)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "role": "tool",
+                "content": raw,
+                "tool_call_id": "legacy_call",
+            }) + "\n")
+
+        reloaded = store.load_transcript(session_id)
+        assert reloaded == [{
+            "role": "tool",
+            "content": raw,
+            "tool_call_id": "legacy_call",
+        }]
+
+    def test_large_tool_output_compacted_before_sqlite_persistence(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_state import SessionDB
+
+        monkeypatch.setenv("HERMES_PERSISTED_TOOL_OUTPUT_MAX_CHARS", "1024")
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = SessionDB(db_path=tmp_path / "state.db")
+        store._loaded = True
+
+        session_id = "large_tool_sqlite"
+        store._db.create_session(session_id=session_id, source="telegram")
+        raw = "z" * 2048
+        store.append_to_transcript(
+            session_id,
+            {"role": "tool", "content": raw, "tool_name": "read_file"},
+        )
+
+        rows = store._db.get_messages_as_conversation(session_id)
+        assert len(rows) == 1
+        assert raw not in rows[0]["content"]
+        assert '"original_char_size": 2048' in rows[0]["content"]
+
+
 class TestLoadTranscriptCorruptLines:
     """Regression: corrupt JSONL lines (e.g. from mid-write crash) must be
     skipped instead of crashing the entire transcript load.  GH-1193."""

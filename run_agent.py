@@ -3147,7 +3147,20 @@ class AIAgent:
             )
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
+            try:
+                from gateway.session import compact_large_tool_result_for_persistence
+            except Exception as compact_err:
+                logger.debug(
+                    "Tool result persistence compaction unavailable: %s",
+                    compact_err,
+                )
+                compact_large_tool_result_for_persistence = None
             for msg in messages[flush_from:]:
+                if compact_large_tool_result_for_persistence:
+                    msg = compact_large_tool_result_for_persistence(
+                        msg,
+                        session_id=self.session_id,
+                    )
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
                 tool_calls_data = None
