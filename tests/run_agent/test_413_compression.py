@@ -775,6 +775,44 @@ class TestToolResultPreflightCompression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
 
+    def test_tool_result_compression_abort_stops_retry_loop(self, agent):
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 130_000
+
+        tc = SimpleNamespace(
+            id="tc1", type="function",
+            function=SimpleNamespace(name="web_search", arguments="{\"query\":\"test\"}"),
+        )
+        tool_resp = _mock_response(
+            content=None,
+            finish_reason="stop",
+            tool_calls=[tc],
+            usage={"prompt_tokens": 130_000, "completion_tokens": 5_000, "total_tokens": 135_000},
+        )
+        agent.client.chat.completions.create.side_effect = [tool_resp]
+
+        def aborting_compress(messages, system_message, **kwargs):
+            agent.context_compressor._last_compress_aborted = True
+            return messages, system_message
+
+        with (
+            patch("run_agent.handle_function_call", return_value="x" * 100_000),
+            patch.object(agent, "_compress_context", side_effect=aborting_compress) as mock_compress,
+            patch.object(agent, "_persist_session") as mock_persist,
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        mock_compress.assert_called_once()
+        mock_persist.assert_called_once()
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["compression_exhausted"] is True
+        assert "Compression aborted" in result["error"]
+
     def test_anthropic_prompt_too_long_safety_net(self, agent):
         """Anthropic 'prompt is too long' error triggers compression as safety net."""
         err_400 = Exception(
