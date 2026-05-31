@@ -10,17 +10,17 @@ Handles:
 
 import hashlib
 import logging
-import os
 import json
+import os
 import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
+from session_persistence import compact_large_tool_result_for_persistence
 
 logger = logging.getLogger(__name__)
-
 
 def _now() -> datetime:
     """Return the current local time."""
