@@ -557,7 +557,7 @@ class TestSessionStoreToolResultCompaction:
 
     def test_large_tool_output_compacted_before_sqlite_persistence(self, store, monkeypatch, caplog):
         monkeypatch.setenv("HERMES_PERSISTED_TOOL_OUTPUT_MAX_CHARS", "1024")
-        caplog.set_level("INFO", logger="gateway.session")
+        caplog.set_level("INFO", logger="session_persistence")
 
         session_id = "large_tool_sqlite"
         store._db.create_session(session_id=session_id, source="telegram")
@@ -624,6 +624,64 @@ class TestSessionStoreToolResultCompaction:
         assert raw not in rows[0]["content"]
         assert "\"original_char_size\": 2048" in rows[0]["content"]
         assert rows[0]["tool_name"] == "read_file"
+
+    def test_direct_session_db_append_compacts_large_tool_output(self, tmp_path, monkeypatch):
+        from hermes_state import SessionDB
+
+        monkeypatch.setenv("HERMES_PERSISTED_TOOL_OUTPUT_MAX_CHARS", "1024")
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "direct_append_large_tool"
+        db.create_session(session_id=session_id, source="test")
+        raw = "d" * 2048
+
+        db.append_message(
+            session_id=session_id,
+            role="tool",
+            content=raw,
+            tool_name="terminal",
+            tool_call_id="call_direct",
+        )
+
+        rows = db.get_messages_as_conversation(session_id)
+        assert len(rows) == 1
+        assert raw not in rows[0]["content"]
+        assert "Hermes compacted persisted tool result" in rows[0]["content"]
+        assert "\"original_char_size\": 2048" in rows[0]["content"]
+        assert rows[0]["tool_name"] == "terminal"
+        assert rows[0]["tool_call_id"] == "call_direct"
+
+    def test_direct_session_db_replace_compacts_tool_result_blocks(self, tmp_path, monkeypatch):
+        from hermes_state import SessionDB
+
+        monkeypatch.setenv("HERMES_PERSISTED_TOOL_OUTPUT_MAX_CHARS", "1024")
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "direct_replace_large_tool_block"
+        db.create_session(session_id=session_id, source="test")
+        raw = "b" * 2048
+
+        db.replace_messages(
+            session_id,
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_direct",
+                            "content": raw,
+                        }
+                    ],
+                }
+            ],
+        )
+
+        rows = db.get_messages_as_conversation(session_id)
+        assert len(rows) == 1
+        block = rows[0]["content"][0]
+        assert block["type"] == "tool_result"
+        assert raw not in block["content"]
+        assert "Hermes compacted persisted tool result" in block["content"]
+        assert "\"tool_call_id\": " in block["content"]
 
 
 class TestLoadTranscriptDBOnly:

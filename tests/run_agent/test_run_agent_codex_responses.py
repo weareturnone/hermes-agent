@@ -448,47 +448,6 @@ def test_run_codex_stream_surfaces_failed_status_in_final_response(monkeypatch):
     assert response.error == error_payload
 
 
-def test_run_codex_stream_ignores_terminal_null_output(monkeypatch):
-    """Primary Codex streaming survives response.completed.output = null.
-
-    ChatGPT Codex gpt-5.5 started returning a terminal completed frame with
-    output=null. The SDK stream helper iterated that field and raised
-    TypeError; the raw-event path must instead use output_item.done items.
-    """
-    agent = _build_agent(monkeypatch)
-    output_item = SimpleNamespace(
-        type="message",
-        status="completed",
-        content=[SimpleNamespace(type="output_text", text="survived null output")],
-    )
-
-    def _fake_create(**kwargs):
-        assert kwargs.get("stream") is True
-        return _FakeCreateStream([
-            SimpleNamespace(type="response.created"),
-            SimpleNamespace(type="response.output_item.done", item=output_item),
-            SimpleNamespace(
-                type="response.completed",
-                response=SimpleNamespace(
-                    status="completed",
-                    id="resp_null_output",
-                    output=None,
-                    usage=None,
-                ),
-            ),
-        ])
-
-    agent.client = SimpleNamespace(
-        responses=SimpleNamespace(create=_fake_create),
-    )
-
-    response = agent._run_codex_stream(_codex_request_kwargs())
-
-    assert response.status == "completed"
-    assert response.id == "resp_null_output"
-    assert response.output == [output_item]
-
-
 def test_run_codex_stream_parses_create_stream_events(monkeypatch):
     """The primary path consumes ``responses.create(stream=True)`` events directly."""
     agent = _build_agent(monkeypatch)

@@ -619,6 +619,50 @@ class TestToolResultPreflightCompression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
 
+    def test_tool_result_compression_allows_same_message_count_when_tokens_drop(self, agent):
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 130_000
+        agent.context_compressor.last_prompt_tokens = 130_000
+
+        tc = SimpleNamespace(
+            id="tc1", type="function",
+            function=SimpleNamespace(name="web_search", arguments="{\"query\":\"test\"}"),
+        )
+        tool_resp = _mock_response(
+            content=None,
+            finish_reason="stop",
+            tool_calls=[tc],
+            usage={"prompt_tokens": 130_000, "completion_tokens": 5_000, "total_tokens": 135_000},
+        )
+        ok_resp = _mock_response(content="Done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [tool_resp, ok_resp]
+
+        def same_count_compress(messages, system_message, **kwargs):
+            return (
+                [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "summary"},
+                    {"role": "tool", "content": "small"},
+                ],
+                system_message,
+            )
+
+        with (
+            patch("run_agent.handle_function_call", return_value="x" * 100_000),
+            patch.object(agent, "_compress_context", side_effect=same_count_compress) as mock_compress,
+            patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=[20_000, 200_000, 20_000, 20_000]),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        mock_compress.assert_called_once()
+        assert agent.client.chat.completions.create.call_count == 2
+        assert result["completed"] is True
+        assert result["final_response"] == "Done"
+
     def test_tool_result_compression_abort_stops_retry_loop(self, agent):
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000

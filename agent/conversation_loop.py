@@ -3637,7 +3637,10 @@ def run_conversation(
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
-                    _pre_compress_len = len(messages)
+                    _pre_compress_tokens = estimate_request_tokens_rough(
+                        messages,
+                        tools=agent.tools or None,
+                    )
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
@@ -3646,7 +3649,15 @@ def run_conversation(
                     _compression_aborted = bool(
                         getattr(agent.context_compressor, "_last_compress_aborted", False)
                     )
-                    if _compression_aborted or len(messages) >= _pre_compress_len:
+                    _post_compress_tokens = estimate_request_tokens_rough(
+                        messages,
+                        tools=agent.tools or None,
+                    )
+                    _compression_made_no_progress = (
+                        not _compression_aborted
+                        and _post_compress_tokens >= _pre_compress_tokens
+                    )
+                    if _compression_aborted or _compression_made_no_progress:
                         _reason = (
                             "Compression aborted"
                             if _compression_aborted

@@ -238,6 +238,25 @@ def _compression_threshold_for_model(model: Optional[str]) -> Optional[float]:
         return 0.75
     return None
 
+
+def resolve_compression_threshold(
+    configured_threshold: Any = None,
+    model: Optional[str] = None,
+) -> float:
+    """Resolve the effective context-compression threshold for a model."""
+    threshold = 0.50
+    if configured_threshold is not None:
+        try:
+            parsed = float(configured_threshold)
+            if 0 < parsed < 1:
+                threshold = parsed
+        except (TypeError, ValueError):
+            pass
+    model_threshold = _compression_threshold_for_model(model)
+    if model_threshold is not None:
+        threshold = model_threshold
+    return threshold
+
 # Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
 def _get_aux_model_for_provider(provider_id: str) -> str:
     """Return the cheap auxiliary model for a provider.

@@ -25,6 +25,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
+from session_persistence import compact_large_tool_result_for_persistence
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -1475,6 +1476,22 @@ class SessionDB:
         platform-specific flows like yuanbao's recall guard to redact a
         message by its platform-side identifier.
         """
+        message = compact_large_tool_result_for_persistence(
+            {
+                "role": role,
+                "content": content,
+                "tool_name": tool_name,
+                "tool_calls": tool_calls,
+                "tool_call_id": tool_call_id,
+            },
+            session_id=session_id,
+        )
+        role = message.get("role", role)
+        content = message.get("content")
+        tool_name = message.get("tool_name")
+        tool_calls = message.get("tool_calls")
+        tool_call_id = message.get("tool_call_id")
+
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
             json.dumps(reasoning_details)
@@ -1549,6 +1566,11 @@ class SessionDB:
         The delete + reinsert sequence must commit as one transaction so a
         mid-rewrite failure does not leave SQLite with a partial transcript.
         """
+
+        messages = [
+            compact_large_tool_result_for_persistence(msg, session_id=session_id)
+            for msg in messages
+        ]
 
         def _do(conn):
             conn.execute(
