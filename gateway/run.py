@@ -8889,7 +8889,8 @@ class GatewayRunner:
             # real token counts.  Having hygiene at 0.50 caused premature
             # compression on every turn in long gateway sessions.
             _hyg_model = "anthropic/claude-sonnet-4.6"
-            _hyg_threshold_pct = 0.85
+            _hyg_threshold_pct = None
+            _hyg_agent_threshold = None
             _hyg_compression_enabled = True
             _hyg_hard_msg_limit = 400
             _hyg_config_context_length = None
@@ -8926,6 +8927,16 @@ class GatewayRunner:
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
                         ).lower() in {"true", "1", "yes"}
+                        _raw_hygiene_threshold = _comp_cfg.get("hygiene_threshold")
+                        if _raw_hygiene_threshold is not None:
+                            try:
+                                _parsed_threshold = float(_raw_hygiene_threshold)
+                                if 0 < _parsed_threshold < 1:
+                                    _hyg_threshold_pct = _parsed_threshold
+                            except (TypeError, ValueError):
+                                pass
+                        else:
+                            _hyg_agent_threshold = _comp_cfg.get("threshold")
                         _raw_hard_limit = _comp_cfg.get("hygiene_hard_message_limit")
                         if _raw_hard_limit is not None:
                             try:
@@ -8977,6 +8988,16 @@ class GatewayRunner:
             except Exception:
                 pass
 
+            if _hyg_threshold_pct is None:
+                try:
+                    from agent.auxiliary_client import resolve_compression_threshold
+                    _hyg_threshold_pct = resolve_compression_threshold(
+                        _hyg_agent_threshold,
+                        _hyg_model,
+                    )
+                except Exception:
+                    _hyg_threshold_pct = 0.50
+
             if _hyg_compression_enabled:
                 _hyg_context_length = get_model_context_length(
                     _hyg_model,
@@ -9003,8 +9024,8 @@ class GatewayRunner:
                     _token_source = "estimated"
                     # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
                     # sessions, but that just means hygiene fires a bit early — which
-                    # is safe and harmless.  The 85% threshold already provides ample
-                    # headroom (agent's own compressor runs at 50%).  A previous 1.4x
+                    # is safe and harmless.  The effective compression threshold provides
+                    # the same trigger as the agent unless hygiene_threshold is set. A previous 1.4x
                     # multiplier tried to compensate by inflating the threshold, but
                     # 85% * 1.4 = 119% of context — which exceeds the model's limit
                     # and prevented hygiene from ever firing for ~200K models (GLM-5).

@@ -3920,11 +3920,47 @@ def run_conversation(
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
+                    _pre_compress_tokens = estimate_request_tokens_rough(
+                        messages,
+                        tools=agent.tools or None,
+                    )
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
                     )
+                    _compression_aborted = bool(
+                        getattr(agent.context_compressor, "_last_compress_aborted", False)
+                    )
+                    _post_compress_tokens = estimate_request_tokens_rough(
+                        messages,
+                        tools=agent.tools or None,
+                    )
+                    _compression_made_no_progress = (
+                        not _compression_aborted
+                        and _post_compress_tokens >= _pre_compress_tokens
+                    )
+                    if _compression_aborted or _compression_made_no_progress:
+                        _reason = (
+                            "Compression aborted"
+                            if _compression_aborted
+                            else "Compression made no progress"
+                        )
+                        _msg = (
+                            f"{_reason}; refusing to retry the same over-threshold context. "
+                            "Run /compress to retry with a focus topic, or /new to start a fresh session."
+                        )
+                        agent._emit_warning(_msg)
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "messages": messages,
+                            "completed": False,
+                            "api_calls": api_call_count,
+                            "error": _msg,
+                            "partial": True,
+                            "failed": True,
+                            "compression_exhausted": True,
+                        }
                     # Compression created a new session — clear history so
                     # _flush_messages_to_session_db writes compressed messages
                     # to the new session (see preflight compression comment).
