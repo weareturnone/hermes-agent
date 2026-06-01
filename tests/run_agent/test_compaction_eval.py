@@ -8,6 +8,7 @@ limits, and pressure-driven compression that would grow the context.
 
 from unittest.mock import patch
 
+from agent.auxiliary_client import resolve_compression_threshold
 from agent.context_compressor import ContextCompressor
 from agent.model_metadata import get_context_length_from_provider_error
 from session_persistence import compact_large_tool_result_for_persistence
@@ -112,3 +113,9 @@ def test_compaction_eval_provider_error_without_limit_does_not_stepdown_context(
 
     assert get_context_length_from_provider_error(generic_overflow, current_context) is None
     assert get_context_length_from_provider_error(explicit_limit, current_context) == 200_000
+
+
+def test_compaction_eval_threshold_resolver_preserves_full_window_setting():
+    assert resolve_compression_threshold("1.0", "gpt-5.5") == 1.0
+    assert resolve_compression_threshold(1, "gpt-5.5") == 1.0
+    assert resolve_compression_threshold("not-a-number", "gpt-5.5") == 0.50

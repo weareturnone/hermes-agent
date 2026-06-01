@@ -248,7 +248,7 @@ def resolve_compression_threshold(
     if configured_threshold is not None:
         try:
             parsed = float(configured_threshold)
-            if 0 < parsed < 1:
+            if 0 < parsed <= 1:
                 threshold = parsed
         except (TypeError, ValueError):
             pass
