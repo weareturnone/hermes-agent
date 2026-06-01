@@ -1,13 +1,19 @@
+import { forceRedraw, type MouseTrackingMode } from '@hermes/ink'
+
 import { NO_CONFIRM_DESTRUCTIVE } from '../../../config/env.js'
 import { dailyFortune, randomFortune } from '../../../content/fortunes.js'
 import { HOTKEYS } from '../../../content/hotkeys.js'
-import { SECTION_NAMES, isSectionName, nextDetailsMode, parseDetailsMode } from '../../../domain/details.js'
+import { isSectionName, nextDetailsMode, parseDetailsMode, SECTION_NAMES } from '../../../domain/details.js'
 import type {
   ConfigGetValueResponse,
   ConfigSetResponse,
+  SessionSaveResponse,
+  SessionStatusResponse,
   SessionSteerResponse,
+  SessionTitleResponse,
   SessionUndoResponse
 } from '../../../gatewayTypes.js'
+import { writeClipboardText } from '../../../lib/clipboard.js'
 import { writeOsc52Clipboard } from '../../../lib/osc52.js'
 import { configureDetectedTerminalKeybindings, configureTerminalKeybindings } from '../../../lib/terminalSetup.js'
 import type { Msg, PanelSection } from '../../../types.js'
@@ -38,10 +44,36 @@ const flagFromArg = (arg: string, current: boolean): boolean | null => {
   return null
 }
 
+// `/mouse` toggles between full tracking and off when called bare so the
+// old binary muscle-memory still works. Explicit presets (wheel / buttons /
+// all) target the tmux-friendly hover-free subsets.
+const MOUSE_MODE_ALIASES: Record<string, MouseTrackingMode> = {
+  all: 'all',
+  any: 'all',
+  button: 'buttons',
+  buttons: 'buttons',
+  click: 'buttons',
+  full: 'all',
+  off: 'off',
+  on: 'all',
+  scroll: 'wheel',
+  wheel: 'wheel'
+}
+
+const mouseModeFromArg = (arg: string, current: MouseTrackingMode): MouseTrackingMode | null => {
+  if (!arg || arg.trim().toLowerCase() === 'toggle') {
+    return current === 'off' ? 'all' : 'off'
+  }
+
+  return MOUSE_MODE_ALIASES[arg.trim().toLowerCase()] ?? null
+}
+
 const RESET_WORDS = new Set(['reset', 'clear', 'default'])
 const CYCLE_WORDS = new Set(['cycle', 'toggle'])
+
 const DETAILS_USAGE =
   'usage: /details [hidden|collapsed|expanded|cycle]  or  /details <section> [hidden|collapsed|expanded|reset]'
+
 const DETAILS_SECTION_USAGE = 'usage: /details <section> [hidden|collapsed|expanded|reset]'
 
 export const coreCommands: SlashCommand[] = [
@@ -78,26 +110,57 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
-    aliases: ['exit', 'q'],
+    aliases: ['exit'],
     help: 'exit hermes',
     name: 'quit',
     run: (_arg, ctx) => ctx.session.die()
   },
 
   {
+    help: 'update Hermes Agent to the latest version (exits TUI)',
+    name: 'update',
+    run: (_arg, ctx) => {
+      ctx.transcript.sys('exiting TUI to run update...')
+      // Exit code 42 signals the Python wrapper to exec `hermes update`.
+      // Use dieWithCode for proper cleanup (gateway kill + Ink unmount).
+      setTimeout(() => ctx.session.dieWithCode(42), 100)
+    }
+  },
+
+  {
+    aliases: ['scroll'],
+    help: 'set mouse tracking preset [on|off|toggle|wheel|buttons|all]',
+    name: 'mouse',
+    run: (arg, ctx) => {
+      const current = ctx.ui.mouseTracking
+      const next = mouseModeFromArg(arg, current)
+
+      if (next === null) {
+        return ctx.transcript.sys('usage: /mouse [on|off|toggle|wheel|buttons|all]')
+      }
+
+      patchUiState({ mouseTracking: next })
+      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'mouse', value: next }).catch(() => {})
+
+      queueMicrotask(() => ctx.transcript.sys(`mouse tracking ${next}`))
+    }
+  },
+
+  {
     aliases: ['new'],
     help: 'start a new session',
     name: 'clear',
-    run: (_arg, ctx, cmd) => {
+    run: (arg, ctx, cmd) => {
       if (ctx.session.guardBusySessionSwitch('switch sessions')) {
         return
       }
 
       const isNew = cmd.startsWith('/new')
+      const requestedTitle = isNew ? arg.trim() : ''
 
       const commit = () => {
         patchUiState({ status: 'forging session…' })
-        ctx.session.newSession(isNew ? 'new session started' : undefined)
+        ctx.session.newSession(isNew ? 'new session started' : undefined, requestedTitle || undefined)
       }
 
       if (NO_CONFIRM_DESTRUCTIVE) {
@@ -118,6 +181,30 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
+    help: 'force a full UI repaint',
+    name: 'redraw',
+    run: (_arg, ctx) => {
+      forceRedraw(process.stdout)
+      ctx.transcript.sys('ui redrawn')
+    }
+  },
+
+  {
+    help: 'show live session info',
+    name: 'status',
+    run: (_arg, ctx) => {
+      if (!ctx.sid) {
+        return ctx.transcript.sys('no active session')
+      }
+
+      ctx.gateway
+        .rpc<SessionStatusResponse>('session.status', { session_id: ctx.sid })
+        .then(ctx.guarded<SessionStatusResponse>(r => ctx.transcript.page(r.output || '(no status)', 'Status')))
+        .catch(ctx.guardedErr)
+    }
+  },
+
+  {
     help: 'resume a prior session',
     name: 'resume',
     run: (arg, ctx) => {
@@ -126,6 +213,47 @@ export const coreCommands: SlashCommand[] = [
       }
 
       arg ? ctx.session.resumeById(arg) : patchOverlayState({ picker: true })
+    }
+  },
+
+  {
+    help: 'set or show current session title',
+    name: 'title',
+    run: (arg, ctx) => {
+      if (!ctx.sid) {
+        return ctx.transcript.sys('no active session')
+      }
+
+      const title = arg.trim()
+
+      if (!arg) {
+        ctx.gateway
+          .rpc<SessionTitleResponse>('session.title', { session_id: ctx.sid })
+          .then(
+            ctx.guarded<SessionTitleResponse>(r => {
+              const current = (r?.title ?? '').trim()
+              ctx.transcript.sys(current ? `title: ${current}` : 'no title set')
+            })
+          )
+          .catch(ctx.guardedErr)
+
+        return
+      }
+
+      if (!title) {
+        return ctx.transcript.sys('usage: /title <your session title>')
+      }
+
+      ctx.gateway
+        .rpc<SessionTitleResponse>('session.title', { session_id: ctx.sid, title })
+        .then(
+          ctx.guarded<SessionTitleResponse>(r => {
+            const next = (r?.title ?? title).trim()
+            const suffix = r?.pending ? ' (queued while session initializes)' : ''
+            ctx.transcript.sys(`session title set: ${next}${suffix}`)
+          })
+        )
+        .catch(ctx.guardedErr)
     }
   },
 
@@ -157,10 +285,12 @@ export const coreCommands: SlashCommand[] = [
         gateway
           .rpc<ConfigGetValueResponse>('config.get', { key: 'details_mode' })
           .then(r => {
-            if (ctx.stale()) return
+            if (ctx.stale()) {
+              return
+            }
 
             const mode = parseDetailsMode(r?.value) ?? ui.detailsMode
-            patchUiState({ detailsMode: mode })
+            patchUiState({ detailsMode: mode, detailsModeCommandOverride: false })
 
             const overrides = SECTION_NAMES.filter(s => ui.sections[s])
               .map(s => `${s}=${ui.sections[s]}`)
@@ -200,7 +330,9 @@ export const coreCommands: SlashCommand[] = [
         return transcript.sys(DETAILS_USAGE)
       }
 
-      patchUiState({ detailsMode: next })
+      const sections = Object.fromEntries(SECTION_NAMES.map(section => [section, next]))
+
+      patchUiState({ detailsMode: next, detailsModeCommandOverride: true, sections })
       gateway.rpc<ConfigSetResponse>('config.set', { key: 'details_mode', value: next }).catch(() => {})
       transcript.sys(`details: ${next}`)
     }
@@ -227,11 +359,19 @@ export const coreCommands: SlashCommand[] = [
   {
     help: 'copy selection or assistant message',
     name: 'copy',
-    run: (arg, ctx) => {
+    run: async (arg, ctx) => {
       const { sys } = ctx.transcript
 
-      if (!arg && ctx.composer.hasSelection && ctx.composer.selection.copySelection()) {
-        return sys('copied selection')
+      if (!arg && ctx.composer.hasSelection) {
+        const text = await ctx.composer.selection.copySelection()
+
+        if (text) {
+          return sys(`copied ${text.length} characters`)
+        } else {
+          return sys(
+            'clipboard copy failed — try HERMES_TUI_FORCE_OSC52=1 to force the escape sequence'
+          )
+        }
       }
 
       if (arg && Number.isNaN(parseInt(arg, 10))) {
@@ -242,11 +382,27 @@ export const coreCommands: SlashCommand[] = [
       const target = all[arg ? Math.min(parseInt(arg, 10), all.length) - 1 : all.length - 1]
 
       if (!target) {
-        return sys('nothing to copy')
+        return sys('nothing to copy — start a conversation first')
       }
 
-      writeOsc52Clipboard(target.text)
-      sys('sent OSC52 copy sequence (terminal support required)')
+      void writeClipboardText(target.text)
+        .then(nativeOk => {
+          if (ctx.stale()) {
+            return
+          }
+
+          if (nativeOk) {
+            sys('copied to clipboard')
+          } else {
+            writeOsc52Clipboard(target.text)
+            sys('sent OSC52 copy sequence (terminal support required)')
+          }
+        })
+        .catch(error => {
+          if (!ctx.stale()) {
+            sys(`copy failed: ${String(error)}`)
+          }
+        })
     }
   },
 
@@ -330,6 +486,39 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
+    help: 'save the current transcript to JSON',
+    name: 'save',
+    run: (_arg, ctx) => {
+      const hasConversation = ctx.local
+        .getHistoryItems()
+        .some(m => m.role === 'user' || m.role === 'assistant' || m.role === 'tool')
+
+      if (!hasConversation) {
+        return ctx.transcript.sys('no conversation yet')
+      }
+
+      if (!ctx.sid) {
+        return ctx.transcript.sys('no active session — nothing to save')
+      }
+
+      ctx.gateway
+        .rpc<SessionSaveResponse>('session.save', { session_id: ctx.sid })
+        .then(
+          ctx.guarded<SessionSaveResponse>(r => {
+            const file = r?.file
+
+            if (file) {
+              ctx.transcript.sys(`conversation saved to: ${file}`)
+            } else {
+              ctx.transcript.sys('failed to save')
+            }
+          })
+        )
+        .catch(ctx.guardedErr)
+    }
+  },
+
+  {
     aliases: ['sb'],
     help: 'status bar position (on|off|top|bottom)',
     name: 'statusbar',
@@ -358,6 +547,7 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
+    aliases: ['q'],
     help: 'inspect or enqueue a message',
     name: 'queue',
     run: (arg, ctx) => {
@@ -397,7 +587,7 @@ export const coreCommands: SlashCommand[] = [
           ctx.guarded<SessionSteerResponse>(r => {
             if (r?.status === 'queued') {
               ctx.transcript.sys(
-                `⏩ steer queued — arrives after next tool call: "${payload.slice(0, 50)}${payload.length > 50 ? '…' : ''}"`
+                `steer queued — arrives after next tool call: "${payload.slice(0, 50)}${payload.length > 50 ? '…' : ''}"`
               )
             } else {
               ctx.transcript.sys('steer rejected')
