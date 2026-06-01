@@ -1593,6 +1593,35 @@ class TestTokenBudgetTailProtection:
         # Should have compressed (fewer messages than original)
         assert len(result) < len(messages)
 
+    def test_pressure_compression_rejects_context_growth(self, budget_compressor):
+        """Regression: auto compaction must not rotate into a larger context.
+
+        The production failure mode was compaction at ~140-157K tokens yielding
+        a larger ~170-185K-token transcript because the preserved tail plus the
+        handoff summary outweighed the removed middle. That causes quality rot:
+        every turn starts with a bigger summary stack and triggers compaction
+        again. Under pressure, reject the candidate instead.
+        """
+        c = budget_compressor
+        c.protect_first_n = 1
+        c.protect_last_n = 3
+        c.tail_token_budget = 500
+
+        messages = [{"role": "system", "content": "System prompt"}]
+        for i in range(12):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"Message {i}"})
+
+        huge_summary = "summary " + ("x" * 700_000)
+        with patch.object(c, "_generate_summary", return_value=huge_summary):
+            result = c.compress(messages, current_tokens=150_000)
+
+        assert result == messages
+        assert c._last_compress_aborted is True
+        assert "would grow context" in c._last_summary_error
+        assert c.compression_count == 0
+        assert c._ineffective_compression_count == 1
+
     def test_prune_with_token_budget(self, budget_compressor):
         """_prune_old_tool_results with protect_tail_tokens respects the budget."""
         c = budget_compressor
