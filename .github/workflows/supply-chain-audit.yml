@@ -137,6 +137,25 @@ jobs:
           # and produced false positives that trained reviewers to ignore the scanner.
           SETUP_HITS=$(git diff --name-only "$BASE"..."$HEAD" | grep -E '^(setup\.py|setup\.cfg|sitecustomize\.py|usercustomize\.py|__init__\.pth)$' || true)
           if [ -n "$SETUP_HITS" ]; then
+            # Upstream added setup.py as a packaging shim that only enumerates
+            # skills/ and optional-skills/ into data_files. Keep install hooks
+            # blocking by default; this exact audited content hash is the only
+            # allowed exception, so behavior changes re-trigger the critical gate.
+            FILTERED_SETUP_HITS=$(mktemp)
+            while IFS= read -r file; do
+              [ -z "$file" ] && continue
+              if [ "$file" = "setup.py" ] && [ -f setup.py ]; then
+                digest=$(sha256sum setup.py | awk '{print $1}')
+                if [ "$digest" = "2d2f6d04d44467713f51a63567d2f2c2f7e18cc37d2af7e045b790f3a7f7ffac" ]; then
+                  echo "setup.py matches audited upstream packaging shim digest; skipping install-hook finding."
+                  continue
+                fi
+              fi
+              echo "$file" >> "$FILTERED_SETUP_HITS"
+            done <<< "$SETUP_HITS"
+            SETUP_HITS=$(cat "$FILTERED_SETUP_HITS")
+          fi
+          if [ -n "$SETUP_HITS" ]; then
             FINDINGS="${FINDINGS}
           ### 🚨 CRITICAL: Install-hook file added or modified
           These files can execute code during package installation or interpreter startup.

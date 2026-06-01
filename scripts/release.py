@@ -741,6 +741,28 @@ AUTHOR_MAP = {
     "franksong2702@gmail.com": "franksong2702",
     "673088860@qq.com": "ambition0802",
     "beibei1988@proton.me": "beibi9966",
+    # Upstream refresh 2026-06-01: old-style noreply and real emails
+    # introduced by the upstream main merge.
+    "AllardQuek@users.noreply.github.com": "AllardQuek",
+    "JiaDe-Wu@users.noreply.github.com": "JiaDe-Wu",
+    "abhinav11082001-stack@users.noreply.github.com": "abhinav11082001-stack",
+    "amethystani@users.noreply.github.com": "amethystani",
+    "batosk2@gmail.com": "Sarbai",
+    "ilonagaja509-glitch@users.noreply.github.com": "ilonagaja509-glitch",
+    "in-liberty420@users.noreply.github.com": "in-liberty420",
+    "info@aminvakil.com": "aminvakil",
+    "jslizar@users.noreply.github.com": "jslizar",
+    "luoyuctl@users.noreply.github.com": "luoyuctl",
+    "luyao618@users.noreply.github.com": "luyao618",
+    "magicray1217@users.noreply.github.com": "Magicray1217",
+    "nikpolale@gmail.com": "polnikale",
+    "pepelax@users.noreply.github.com": "pepelax",
+    "pingchesu@users.noreply.github.com": "pingchesu",
+    "pochi-gio@users.noreply.github.com": "pochi-gio",
+    "rames-jusso@users.noreply.github.com": "rames-jusso",
+    "redpiggy-cyber@users.noreply.github.com": "redpiggy-cyber",
+    "roadhero@users.noreply.github.com": "roadhero",
+    "sohyuanchin@gmail.com": "wysie",
     # ── bulk addition: 75 emails resolved via API, PR salvage bodies, noreply
     #    crossref, and GH contributor list matching (April 2026 audit) ──
     "1115117931@qq.com": "aaronlab",
