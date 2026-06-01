@@ -1860,6 +1860,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # this, /compress would silently no-op for 30-60s after a failure.
         if force and self._summary_failure_cooldown_until > 0.0:
             self._summary_failure_cooldown_until = 0.0
+        original_messages = messages
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
@@ -2042,8 +2043,6 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 _merge_summary_into_tail = False
             compressed.append(msg)
 
-        self.compression_count += 1
-
         compressed = self._sanitize_tool_pairs(compressed)
 
         # Replace image parts in all compressed messages before the newest
@@ -2057,13 +2056,33 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         new_estimate = estimate_messages_tokens_rough(compressed)
         saved_estimate = display_tokens - new_estimate
 
-        # Anti-thrashing: track compression effectiveness
+        # Anti-thrashing: track compression effectiveness. If a pressure-driven
+        # compression would grow the estimated context, reject it instead of
+        # rotating into a worse summary state and compacting again next turn.
         savings_pct = (saved_estimate / display_tokens * 100) if display_tokens > 0 else 0
         self._last_compression_savings_pct = savings_pct
         if savings_pct < 10:
             self._ineffective_compression_count += 1
         else:
             self._ineffective_compression_count = 0
+
+        if current_tokens is not None and display_tokens >= MINIMUM_CONTEXT_LENGTH and saved_estimate <= 0:
+            self._last_compress_aborted = True
+            self._last_summary_error = (
+                "ineffective compression would grow context "
+                f"(~{display_tokens:,} -> ~{new_estimate:,} tokens)"
+            )
+            if not self.quiet_mode:
+                logger.warning(
+                    "Compression rejected: estimated context would grow "
+                    "from ~%d to ~%d tokens (%.0f%% savings).",
+                    display_tokens,
+                    new_estimate,
+                    savings_pct,
+                )
+            return original_messages
+
+        self.compression_count += 1
 
         if not self.quiet_mode:
             logger.info(
