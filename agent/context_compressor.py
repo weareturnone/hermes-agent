@@ -2889,6 +2889,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # this, /compress would silently no-op for 30-60s after a failure.
         if force:
             self._clear_compression_failure_cooldown()
+        original_messages = messages
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
@@ -3190,8 +3191,6 @@ This compaction should PRIORITISE preserving all information related to the focu
                 _merge_summary_into_tail = False
             compressed.append(msg)
 
-        self.compression_count += 1
-
         compressed = self._sanitize_tool_pairs(compressed)
 
         # Replace image parts in all compressed messages before the newest
@@ -3223,6 +3222,33 @@ This compaction should PRIORITISE preserving all information related to the focu
         # actual question: did this completed boundary get under the threshold?
         # Counting a low message-savings estimate here as well would give one
         # compaction two strikes when that real reading remains over threshold.
+
+        # If a pressure-driven candidate grows the same message-only estimate,
+        # reject it instead of rotating into a worse summary state. Unlike a
+        # completed boundary, this no-op will not receive a provider usage
+        # verdict, so record its anti-thrash strike here.
+        if (
+            current_tokens is not None
+            and new_estimate >= MINIMUM_CONTEXT_LENGTH
+            and saved_estimate <= 0
+        ):
+            self._ineffective_compression_count += 1
+            self._last_compress_aborted = True
+            self._last_summary_error = (
+                "ineffective compression would grow context "
+                f"(~{pre_estimate:,} -> ~{new_estimate:,} tokens)"
+            )
+            if not self.quiet_mode:
+                logger.warning(
+                    "Compression rejected: estimated context would grow "
+                    "from ~%d to ~%d tokens (%.0f%% savings).",
+                    pre_estimate,
+                    new_estimate,
+                    savings_pct,
+                )
+            return original_messages
+
+        self.compression_count += 1
 
         if not self.quiet_mode:
             logger.info(
