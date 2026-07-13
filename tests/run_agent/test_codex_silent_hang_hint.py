@@ -2,7 +2,7 @@
 
 The helper substitutes an actionable hint into the stale-call timeout
 warning when the request matches a known Codex silent-reject pattern
-(gpt-5.5 family on the ChatGPT Codex backend).  See issue #21444 for
+(gpt-5.5 and gpt-5.6 families on the ChatGPT Codex backend). See issue #21444 for
 symptom history.
 """
 
@@ -61,6 +61,18 @@ def test_hint_fires_for_gpt_5_5_codex_suffix(tmp_path):
     assert hint is not None
 
 
+@pytest.mark.parametrize("model", [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "openai/gpt-5.6-sol",
+])
+def test_hint_fires_for_gpt_5_6_family(tmp_path, model):
+    agent = _make_agent(tmp_path, model=model)
+    agent.api_mode = "codex_responses"
+    assert agent._codex_silent_hang_hint(model=model) is not None
+
+
 def test_hint_fires_when_model_arg_omitted(tmp_path):
     """The helper falls back to ``self.model`` when ``model=`` not passed."""
     agent = _make_agent(tmp_path)
@@ -84,6 +96,12 @@ def test_hint_skipped_for_gpt_5_50_false_positive(tmp_path):
     agent = _make_agent(tmp_path, model="gpt-5.50")
     agent.api_mode = "codex_responses"
     assert agent._codex_silent_hang_hint(model="gpt-5.50") is None
+
+
+def test_hint_skipped_for_gpt_5_60_false_positive(tmp_path):
+    agent = _make_agent(tmp_path, model="gpt-5.60")
+    agent.api_mode = "codex_responses"
+    assert agent._codex_silent_hang_hint(model="gpt-5.60") is None
 
 
 def test_hint_skipped_for_non_codex_api_mode(tmp_path):

@@ -972,7 +972,8 @@ class AIAgent:
 
         This helper substitutes an actionable hint into the stale-timeout
         warning when the request matches a known silent-reject pattern.
-        Currently flagged: ``gpt-5.5`` family on the Codex backend.  See
+        Currently flagged: ``gpt-5.5`` and ``gpt-5.6`` families on the Codex
+        backend.  See
         hermes-agent #21444 for the symptom history.  The upstream backend
         behavior has historically come and gone with ChatGPT entitlement
         changes — the heuristic stays in place as future-proofing even when
@@ -995,11 +996,11 @@ class AIAgent:
             return None
         eff_model = (model if model is not None else self.model) or ""
         model_lower = eff_model.lower()
-        # Match the gpt-5.5 family — bare ``gpt-5.5``, ``gpt-5.5-codex``,
-        # vendor-prefixed variants like ``openai/gpt-5.5``, and any future
-        # ``gpt-5.5-*`` SKU.  Anchor at a word boundary on either side so
-        # unrelated tokens like ``gpt-5.50`` do not match.
-        if not re.search(r"(?:^|[/\-_])gpt-5\.5(?:$|[\-_])", model_lower):
+        # Match the gpt-5.5 and gpt-5.6 families — bare slugs,
+        # vendor-prefixed variants, and suffixed SKUs such as
+        # ``gpt-5.6-sol``. Anchor at a word boundary on either side so
+        # unrelated tokens like ``gpt-5.50`` or ``gpt-5.60`` do not match.
+        if not re.search(r"(?:^|[/\-_])gpt-5\.[56](?:$|[\-_])", model_lower):
             return None
         return (
             f"Codex backend appears to be silently rejecting {eff_model!r} "

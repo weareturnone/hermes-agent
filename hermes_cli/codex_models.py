@@ -12,6 +12,9 @@ import os
 logger = logging.getLogger(__name__)
 
 DEFAULT_CODEX_MODELS: List[str] = [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-5.5",
     "gpt-5.4-mini",
     "gpt-5.4",
@@ -35,6 +38,12 @@ DEFAULT_CODEX_MODELS: List[str] = [
 ]
 
 _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
+    # Keep the fork-local GPT-5.6 family visible when an account's live
+    # lineup is older. The Codex backend remains authoritative for actual
+    # entitlement and availability, as with the existing synthetic entries.
+    ("gpt-5.6-sol", ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex")),
+    ("gpt-5.6-terra", ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex")),
+    ("gpt-5.6-luna", ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex")),
     ("gpt-5.5", ("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex")),
     ("gpt-5.4-mini", ("gpt-5.3-codex", "gpt-5.2-codex")),
     ("gpt-5.4", ("gpt-5.3-codex", "gpt-5.2-codex")),

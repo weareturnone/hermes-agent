@@ -53,6 +53,8 @@ def test_get_codex_model_ids_falls_back_to_curated_defaults(tmp_path, monkeypatc
     models = get_codex_model_ids()
 
     assert models[: len(DEFAULT_CODEX_MODELS)] == DEFAULT_CODEX_MODELS
+    assert models[:3] == ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+    assert "gpt-5.6" not in models
     assert "gpt-5.4" in models
     assert "gpt-5.3-codex-spark" in models
 
@@ -74,6 +76,30 @@ def test_get_codex_model_ids_adds_forward_compat_models_from_templates(monkeypat
     ]
 
 
+def test_get_codex_model_ids_adds_gpt_5_6_family_from_gpt_5_5(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._fetch_models_from_api",
+        lambda access_token: ["gpt-5.5"],
+    )
+
+    models = get_codex_model_ids(access_token="codex-access-token")
+
+    assert models == [
+        "gpt-5.5",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]
+
+
+def test_gpt_5_6_family_is_not_in_public_openai_catalogs():
+    from hermes_cli.models import _PROVIDER_MODELS
+
+    gpt_56 = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+    assert gpt_56.isdisjoint(_PROVIDER_MODELS["openai"])
+    assert gpt_56.isdisjoint(_PROVIDER_MODELS["openai-api"])
+
+
 def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
     """Regression: gpt-5.3-codex-spark is returned by the live Codex backend
     with ``supported_in_api: false`` because it isn't in the public OpenAI
@@ -90,6 +116,9 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
         def json(self):
             return {
                 "models": [
+                    {"slug": "gpt-5.6-sol", "priority": 0, "supported_in_api": False},
+                    {"slug": "gpt-5.6-terra", "priority": 1, "supported_in_api": False},
+                    {"slug": "gpt-5.6-luna", "priority": 2, "supported_in_api": False},
                     {"slug": "gpt-5.5", "priority": 0, "supported_in_api": True},
                     {"slug": "gpt-5.3-codex-spark", "priority": 7, "supported_in_api": False},
                     {"slug": "gpt-5-internal", "priority": 99, "visibility": "hidden"},
@@ -105,6 +134,7 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
 
     models = codex_models._fetch_models_from_api(access_token="tok")
 
+    assert all(model in models for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"))
     assert "gpt-5.5" in models
     assert "gpt-5.3-codex-spark" in models
     assert "gpt-5-internal" not in models

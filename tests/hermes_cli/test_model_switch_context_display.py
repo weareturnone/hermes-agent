@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.model_switch import resolve_display_context_length
 
 
@@ -40,6 +42,21 @@ class TestResolveDisplayContextLength:
         assert ctx == 272_000, (
             "Codex OAuth's 272K cap must win over models.dev's 1.05M for gpt-5.5"
         )
+
+    @pytest.mark.parametrize("model", [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ])
+    def test_gpt_5_6_codex_oauth_context_override(self, model):
+        ctx = resolve_display_context_length(
+            model,
+            "openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_key="",
+            model_info=_FakeModelInfo(1_050_000),
+        )
+        assert ctx == 272_000
 
     def test_falls_back_to_model_info_when_resolver_returns_none(self):
         fake_mi = _FakeModelInfo(1_048_576)

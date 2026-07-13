@@ -304,6 +304,9 @@ class TestCodexOAuthContextLength:
         from agent.model_metadata import get_model_context_length
 
         expected = {
+            "gpt-5.6-sol": 272_000,
+            "gpt-5.6-terra": 272_000,
+            "gpt-5.6-luna": 272_000,
             "gpt-5.5": 272_000,
             "gpt-5.4": 272_000,
             "gpt-5.4-mini": 272_000,
@@ -328,6 +331,16 @@ class TestCodexOAuthContextLength:
                     "(models.dev leakage?)"
                 )
 
+    def test_gpt_5_6_default_context_entries_match_live_codex_values(self):
+        assert {
+            model: DEFAULT_CONTEXT_LENGTHS[model]
+            for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+        } == {
+            "gpt-5.6-sol": 272_000,
+            "gpt-5.6-terra": 272_000,
+            "gpt-5.6-luna": 272_000,
+        }
+
     def test_live_probe_overrides_fallback(self):
         """When a token is provided, the live /models probe is preferred
         and its context_window drives the result."""
@@ -337,6 +350,9 @@ class TestCodexOAuthContextLength:
         fake_response.status_code = 200
         fake_response.json.return_value = {
             "models": [
+                {"slug": "gpt-5.6-sol", "context_window": 300_000},
+                {"slug": "gpt-5.6-terra", "context_window": 310_000},
+                {"slug": "gpt-5.6-luna", "context_window": 320_000},
                 {"slug": "gpt-5.5", "context_window": 300_000},
                 {"slug": "gpt-5.4", "context_window": 400_000},
             ]
@@ -357,8 +373,22 @@ class TestCodexOAuthContextLength:
                 api_key="fake-token",
                 provider="openai-codex",
             )
+            ctx_56 = {
+                slug: get_model_context_length(
+                    model=slug,
+                    base_url="https://chatgpt.com/backend-api/codex",
+                    api_key="fake-token",
+                    provider="openai-codex",
+                )
+                for slug in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+            }
         assert ctx_55 == 300_000
         assert ctx_54 == 400_000
+        assert ctx_56 == {
+            "gpt-5.6-sol": 300_000,
+            "gpt-5.6-terra": 310_000,
+            "gpt-5.6-luna": 320_000,
+        }
 
     def test_probe_failure_falls_back_to_hardcoded(self):
         """If the probe fails (non-200 / network error), we still return

@@ -151,6 +151,11 @@ DEFAULT_CONTEXT_LENGTHS = {
     "claude": 200000,
     # OpenAI — GPT-5 family (most have 400k; specific overrides first)
     # Source: https://developers.openai.com/api/docs/models
+    # GPT-5.6 sol/terra/luna are Codex-OAuth-only and expose 272K windows
+    # (verified via the live ChatGPT Codex /models endpoint, Jul 2026).
+    "gpt-5.6-sol": 272_000,
+    "gpt-5.6-terra": 272_000,
+    "gpt-5.6-luna": 272_000,
     # GPT-5.5 (launched Apr 23 2026) is 1.05M on the direct OpenAI API and
     # ChatGPT Codex OAuth caps it at 272K; both paths resolve via their own
     # provider-aware branches (_resolve_codex_oauth_context_length + models.dev).
@@ -1237,7 +1242,7 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> 
 
 
 # Known ChatGPT Codex OAuth context windows (observed via live
-# chatgpt.com/backend-api/codex/models probe, Apr 2026). These are the
+# chatgpt.com/backend-api/codex/models probes, Apr-Jul 2026). These are the
 # `context_window` values, which are what Codex actually enforces — the
 # direct OpenAI API has larger limits for the same slugs, but Codex OAuth
 # caps lower (e.g. gpt-5.5 is 1.05M on the API, 272K on Codex).
@@ -1245,6 +1250,9 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> 
 # Used as a fallback when the live probe fails (no token, network error).
 # Longest keys first so substring match picks the most specific entry.
 _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
+    "gpt-5.6-terra": 272_000,
+    "gpt-5.6-luna": 272_000,
+    "gpt-5.6-sol": 272_000,
     "gpt-5.1-codex-max": 272_000,
     "gpt-5.1-codex-mini": 272_000,
     "gpt-5.3-codex": 272_000,
