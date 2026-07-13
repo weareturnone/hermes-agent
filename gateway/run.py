@@ -11120,14 +11120,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 get_model_context_length_async,
             )
 
-            # Read model + compression config from config.yaml.
-            # NOTE: hygiene threshold is intentionally HIGHER than the agent's
-            # own compressor (0.85 vs 0.50).  Hygiene is a safety net for
-            # sessions that grew too large between turns — it fires pre-agent
-            # to prevent API failures.  The agent's own compressor handles
-            # normal context management during its tool loop with accurate
-            # real token counts.  Having hygiene at 0.50 caused premature
-            # compression on every turn in long gateway sessions.
+            # Read model + compression config from config.yaml. Gateway
+            # hygiene is a pre-agent safety net for sessions that grew too
+            # large between turns. By default it follows the same
+            # compression.threshold as the agent so messaging and CLI do not
+            # drift; compression.hygiene_threshold is available for operators
+            # who intentionally want a separate gateway trigger.
             _hyg_model = "anthropic/claude-sonnet-4.6"
             _hyg_threshold_pct = 0.85
             _hyg_compression_enabled = True
@@ -11158,14 +11156,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_provider = _model_cfg.get("provider") or None
                         _hyg_base_url = _model_cfg.get("base_url") or None
 
-                    # Read compression settings — only use enabled flag.
-                    # The threshold is intentionally separate from the agent's
-                    # compression.threshold (hygiene runs higher).
+                    # Read compression settings. Prefer an explicit hygiene
+                    # threshold, otherwise follow the agent threshold.
                     _comp_cfg = _hyg_data.get("compression", {})
                     if isinstance(_comp_cfg, dict):
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
                         ).lower() in {"true", "1", "yes"}
+                        _raw_threshold = _comp_cfg.get(
+                            "hygiene_threshold",
+                            _comp_cfg.get("threshold"),
+                        )
+                        if _raw_threshold is not None:
+                            try:
+                                _parsed_threshold = float(_raw_threshold)
+                                if 0 < _parsed_threshold < 1:
+                                    _hyg_threshold_pct = _parsed_threshold
+                            except (TypeError, ValueError):
+                                pass
                         _raw_hard_limit = _comp_cfg.get("hygiene_hard_message_limit")
                         if _raw_hard_limit is not None:
                             try:
