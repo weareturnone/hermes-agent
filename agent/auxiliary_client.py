@@ -441,6 +441,37 @@ def _compression_threshold_for_model(
         return _CODEX_SPARK_COMPACTION_THRESHOLD
     return None
 
+
+def resolve_compression_threshold(
+    configured_threshold: Any = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    *,
+    allow_codex_gpt55_autoraise: bool = True,
+) -> float:
+    """Resolve the effective context-compression threshold for a model."""
+    threshold = 0.50
+    if configured_threshold is not None:
+        try:
+            parsed = float(configured_threshold)
+            if 0 < parsed < 1:
+                threshold = parsed
+        except (TypeError, ValueError):
+            pass
+    model_threshold = _compression_threshold_for_model(
+        model,
+        provider,
+        allow_codex_gpt55_autoraise=allow_codex_gpt55_autoraise,
+    )
+    if model_threshold is not None:
+        if _is_codex_gpt54_or_gpt55(model, provider) or _is_codex_spark(
+            model, provider
+        ):
+            threshold = max(threshold, model_threshold)
+        else:
+            threshold = model_threshold
+    return threshold
+
 # Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
 def _get_aux_model_for_provider(provider_id: str) -> str:
     """Return the cheap auxiliary model for a provider.
