@@ -16489,16 +16489,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 get_model_context_length_async,
             )
 
-            # Read model + compression config from config.yaml.
-            # NOTE: hygiene threshold is intentionally HIGHER than the agent's
-            # own compressor (0.85 vs 0.50).  Hygiene is a safety net for
-            # sessions that grew too large between turns — it fires pre-agent
-            # to prevent API failures.  The agent's own compressor handles
-            # normal context management during its tool loop with accurate
-            # real token counts.  Having hygiene at 0.50 caused premature
-            # compression on every turn in long gateway sessions.
+            # Read model + compression config from config.yaml. Gateway
+            # hygiene is a pre-agent safety net for sessions that grew too
+            # large between turns. By default it follows the agent compression
+            # threshold; operators may explicitly configure a separate valid
+            # hygiene_threshold when they need a different gateway trigger.
             _hyg_model = "anthropic/claude-sonnet-4.6"
-            _hyg_threshold_pct = 0.85
+            _hyg_threshold_pct = 0.50
             _hyg_compression_enabled = True
             _hyg_hard_msg_limit = 5000
             _hyg_timeout_seconds = 30.0
@@ -16533,14 +16530,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_provider = _model_cfg.get("provider") or None
                         _hyg_base_url = _model_cfg.get("base_url") or None
 
-                    # Read compression settings — only use enabled flag.
-                    # The threshold is intentionally separate from the agent's
-                    # compression.threshold (hygiene runs higher).
+                    # Read compression settings. A valid explicit hygiene
+                    # threshold is the only gateway-specific override; an
+                    # invalid override safely leaves the agent threshold in
+                    # effect.
                     _comp_cfg = _hyg_data.get("compression", {})
                     if isinstance(_comp_cfg, dict):
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
                         ).lower() in {"true", "1", "yes"}
+                        _raw_threshold = _comp_cfg.get("threshold")
+                        if _raw_threshold is not None:
+                            try:
+                                _parsed_threshold = float(_raw_threshold)
+                                if 0 < _parsed_threshold < 1:
+                                    _hyg_threshold_pct = _parsed_threshold
+                            except (TypeError, ValueError):
+                                pass
+                        _raw_hygiene_threshold = _comp_cfg.get(
+                            "hygiene_threshold"
+                        )
+                        if _raw_hygiene_threshold is not None:
+                            try:
+                                _parsed_hygiene_threshold = float(
+                                    _raw_hygiene_threshold
+                                )
+                                if 0 < _parsed_hygiene_threshold < 1:
+                                    _hyg_threshold_pct = (
+                                        _parsed_hygiene_threshold
+                                    )
+                            except (TypeError, ValueError):
+                                pass
                         _raw_hard_limit = _comp_cfg.get("hygiene_hard_message_limit")
                         if _raw_hard_limit is not None:
                             try:
