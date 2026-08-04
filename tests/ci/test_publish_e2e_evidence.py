@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
-import re
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -26,322 +26,412 @@ _WORKFLOW_PATH = (
     / "publish-e2e-evidence.yml"
 )
 _GH_IMAGE_COMMIT = "44f4b93ecbbe22de6c45fa2f62f519aee564ca8c"
-_GH_IMAGE_LINUX_AMD64_SHA256 = (
-    "0505f8c46d63bd603a445fdbfdd6be45e75a80778d97f1edf3580697fa6b7919"
-)
-_GH_IMAGE_RELEASE_REF = "v1.2.0"
-_GH_IMAGE_RELEASE_ASSET = "gh-image_1.2.0_linux_amd64.tar.gz"
 _GH_IMAGE_SOURCE_INSTALL = (
     "gh extension install drogers0/gh-image --pin " f"{_GH_IMAGE_COMMIT}"
 )
-_GH_IMAGE_BINARY_CHECKSUM = (
+_PUBLISHER_RUN = (
     "set -euo pipefail\n"
-    f"echo '{_GH_IMAGE_LINUX_AMD64_SHA256}  {_GH_IMAGE_RELEASE_ASSET}' "
-    "| sha256sum -c -"
+    "\n"
+    'PR_NUMBER=$(gh api "repos/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID" '
+    "--jq '.pull_requests[0].number // empty')\n"
+    'if [ -z "$PR_NUMBER" ]; then\n'
+    '  echo "No pull request is associated with CI run $SOURCE_RUN_ID."\n'
+    "  exit 0\n"
+    "fi\n"
+    "\n"
+    'ARTIFACT_NAME=$(gh api "repos/$SOURCE_REPO/actions/runs/$SOURCE_RUN_ID/artifacts" \\\n'
+    "  --jq '.artifacts[] | select(.expired == false and (.name | "
+    "startswith(\"e2e-evidence-\"))) | .name' \\\n"
+    "  | python3 -c 'import sys; print(next(iter(sys.stdin), \"\").strip())')\n"
+    'if [ -z "$ARTIFACT_NAME" ]; then\n'
+    '  echo "No E2E evidence artifact was produced for CI run $SOURCE_RUN_ID."\n'
+    "  exit 0\n"
+    "fi\n"
+    "\n"
+    'EVIDENCE_DIR="$RUNNER_TEMP/e2e-evidence"\n'
+    'mkdir -p "$EVIDENCE_DIR"\n'
+    'gh run download "$SOURCE_RUN_ID" --repo "$SOURCE_REPO" '
+    '--name "$ARTIFACT_NAME" --dir "$EVIDENCE_DIR"\n'
+    "\n"
+    "python3 scripts/ci/publish_e2e_evidence.py \\\n"
+    '  --evidence-dir "$EVIDENCE_DIR" \\\n'
+    '  --source-repo "$SOURCE_REPO" \\\n'
+    '  --pr-number "$PR_NUMBER"\n'
 )
+_EXPECTED_PUBLISH_STEPS = [
+    {
+        "name": "Check out trusted publisher",
+        "uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+        "with": {
+            "ref": "${{ github.event.repository.default_branch }}",
+            "persist-credentials": False,
+        },
+    },
+    {
+        "name": "Install gh-image",
+        "env": {"GH_TOKEN": "${{ github.token }}"},
+        "run": _GH_IMAGE_SOURCE_INSTALL,
+    },
+    {
+        "name": "Download and attach evidence",
+        "env": {
+            "GH_TOKEN": "${{ github.token }}",
+            "GITHUB_TOKEN": "${{ github.token }}",
+            "GH_SESSION_TOKEN": "${{ secrets.GH_IMAGE_SESSION_TOKEN }}",
+            "SOURCE_REPO": "${{ github.repository }}",
+            "SOURCE_RUN_ID": "${{ github.event.workflow_run.id }}",
+        },
+        "run": _PUBLISHER_RUN,
+    },
+]
+_EXPECTED_PERMISSIONS = {
+    "actions": "read",
+    "contents": "read",
+    "pull-requests": "write",
+}
+_EXPECTED_PUBLISH_JOB = {
+    "name": "Publish inline E2E evidence",
+    "if": "github.event.workflow_run.event == 'pull_request'",
+    "runs-on": "ubuntu-latest",
+    "timeout-minutes": 10,
+    "environment": "gh-image",
+    "steps": _EXPECTED_PUBLISH_STEPS,
+}
+_COMPLETE_VALID_WORKFLOW = {
+    "name": "Publish E2E evidence",
+    True: {
+        "workflow_run": {
+            "workflows": ["CI"],
+            "types": ["completed"],
+        },
+    },
+    "permissions": _EXPECTED_PERMISSIONS,
+    "concurrency": {
+        "group": "publish-e2e-evidence-${{ github.event.workflow_run.id }}",
+        "cancel-in-progress": False,
+    },
+    "jobs": {"publish": _EXPECTED_PUBLISH_JOB},
+}
 
 
-def _is_approved_binary_download(run):
-    lines = run.splitlines()
-    if len(lines) != 2 or lines[0] != "set -euo pipefail":
-        return False
-
-    return bool(
-        re.fullmatch(
-            rf"curl -LO https://[A-Za-z0-9.-]+(?:/[A-Za-z0-9._~-]+)*/"
-            rf"{re.escape(_GH_IMAGE_RELEASE_REF)}/"
-            rf"{re.escape(_GH_IMAGE_RELEASE_ASSET)}",
-            lines[1],
-        )
+def _assert_exact_publisher_graph(workflow):
+    """Audit parsed YAML without installing or executing gh-image."""
+    assert workflow.get("permissions") == _EXPECTED_PERMISSIONS, (
+        "workflow permissions must exactly match the reviewed publisher permissions"
+    )
+    assert "env" not in workflow, "workflow env must be absent"
+    assert "defaults" not in workflow, "workflow defaults must be absent"
+    assert workflow.get("jobs") == {"publish": _EXPECTED_PUBLISH_JOB}, (
+        "jobs must contain only the exact reviewed publish execution envelope"
     )
 
 
-def _is_source_install_attempt(run):
-    return bool(
-        re.fullmatch(
-            r"gh extension install drogers0/gh-image --pin [^\s]+",
-            run,
-        )
-    )
+def _approved_workflow():
+    return deepcopy(_COMPLETE_VALID_WORKFLOW)
 
 
-def _is_binary_download_attempt(run):
-    lines = run.splitlines()
-    if len(lines) != 2 or lines[0] != "set -euo pipefail":
-        return False
-
-    return bool(
-        re.fullmatch(
-            r"curl -LO https://[A-Za-z0-9.-]+(?:/[A-Za-z0-9._~-]+)*/"
-            r"gh-image[^\s/]*",
-            lines[1],
-        )
-    )
+def _replace_workflow(**changes):
+    workflow = _approved_workflow()
+    workflow.update(changes)
+    return workflow
 
 
-def _assert_gh_image_identity_is_verified_before_privilege(workflow):
-    """Audit parsed workflow steps without installing or executing gh-image."""
-    job = workflow["jobs"]["publish"]
-    assert "GH_SESSION_TOKEN" not in workflow.get("env", {})
-    assert "GH_SESSION_TOKEN" not in job.get("env", {})
-
-    immutable_identity = False
-    identity_selections = 0
-    binary_download_pending = False
-
-    for step in job["steps"]:
-        run_value = step.get("run")
-        run = "" if run_value is None else str(run_value)
-
-        if "GH_SESSION_TOKEN" in step.get("env", {}):
-            assert immutable_identity, (
-                "GH_SESSION_TOKEN must not be exposed before gh-image has an "
-                "immutable, fail-closed execution identity"
-            )
-
-        if binary_download_pending:
-            assert run == _GH_IMAGE_BINARY_CHECKSUM, (
-                "gh-image binary selection must immediately use the exact "
-                "fail-closed checksum step"
-            )
-            binary_download_pending = False
-            immutable_identity = True
-            continue
-
-        if not immutable_identity:
-            if run == _GH_IMAGE_SOURCE_INSTALL:
-                identity_selections += 1
-                immutable_identity = True
-                continue
-
-            if _is_approved_binary_download(run):
-                identity_selections += 1
-                binary_download_pending = True
-                continue
-
-            assert not run, (
-                "every non-empty run step before gh-image identity selection "
-                "must exactly match one reviewed immutable install shape"
-            )
-            continue
-
-        assert not (
-            _is_source_install_attempt(run) or _is_binary_download_attempt(run)
-        ), "gh-image must have exactly one immutable identity selection"
-
-    assert not binary_download_pending, (
-        "gh-image binary selection is incomplete without exact checksum verification"
-    )
-    assert identity_selections == 1, (
-        "workflow must select exactly one verified gh-image identity"
-    )
+def _omit_workflow_key(key):
+    workflow = _approved_workflow()
+    del workflow[key]
+    return workflow
 
 
-def _workflow_with_steps(*steps):
-    return {"jobs": {"publish": {"steps": list(steps)}}}
+def _replace_job(**changes):
+    workflow = _approved_workflow()
+    workflow["jobs"]["publish"].update(changes)
+    return workflow
 
 
-def test_publish_workflow_verifies_immutable_gh_image_before_privileged_token():
+def _add_job(name, job):
+    workflow = _approved_workflow()
+    workflow["jobs"][name] = job
+    return workflow
+
+
+def _replace_step(index, **changes):
+    workflow = _approved_workflow()
+    workflow["jobs"]["publish"]["steps"][index].update(changes)
+    return workflow
+
+
+def _insert_step(index, step):
+    workflow = _approved_workflow()
+    workflow["jobs"]["publish"]["steps"].insert(index, step)
+    return workflow
+
+
+def _omit_step(index):
+    workflow = _approved_workflow()
+    del workflow["jobs"]["publish"]["steps"][index]
+    return workflow
+
+
+def _expose_job_or_workflow_token(scope):
+    workflow = _approved_workflow()
+    target = workflow if scope == "workflow" else workflow["jobs"]["publish"]
+    target["env"] = {"GH_SESSION_TOKEN": "${{ secrets.GH_IMAGE_SESSION_TOKEN }}"}
+    return workflow
+
+
+def test_publish_workflow_has_exact_privileged_publisher_graph():
     workflow = yaml.safe_load(_WORKFLOW_PATH.read_text(encoding="utf-8"))
 
-    _assert_gh_image_identity_is_verified_before_privilege(workflow)
+    _assert_exact_publisher_graph(workflow)
 
 
 @pytest.mark.parametrize(
-    "steps",
+    "workflow",
     [
-        (
-            {"uses": "actions/checkout@immutable"},
-            {},
-            {"run": ""},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
-            {
-                "run": (
-                    "set -euo pipefail\n"
-                    "curl -LO https://example.invalid/gh-image/"
-                    f"{_GH_IMAGE_RELEASE_REF}/{_GH_IMAGE_RELEASE_ASSET}"
-                )
-            },
-            {"run": _GH_IMAGE_BINARY_CHECKSUM},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
+        _approved_workflow(),
     ],
-    ids=["source_commit", "verified_linux_amd64_binary"],
+    ids=["exact_source_publisher_graph"],
 )
-def test_gh_image_identity_audit_accepts_approved_workflow_shapes(steps):
-    _assert_gh_image_identity_is_verified_before_privilege(
-        _workflow_with_steps(*steps)
-    )
+def test_exact_publisher_graph_accepts_approved_shape(workflow):
+    _assert_exact_publisher_graph(workflow)
 
 
 @pytest.mark.parametrize(
-    "steps",
+    "workflow",
     [
-        (
-            {"run": "gh extension install drogers0/gh-image --pin v1.2.0"},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        _expose_job_or_workflow_token("workflow"),
+        _expose_job_or_workflow_token("job"),
+    ],
+    ids=["workflow_env_token", "job_env_token"],
+)
+def test_exact_publisher_graph_rejects_early_token_scope(workflow):
+    with pytest.raises(AssertionError):
+        _assert_exact_publisher_graph(workflow)
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        _replace_workflow(env={"PATH": "/tmp/attacker"}),
+        _replace_workflow(env={"BASH_ENV": "/tmp/attacker"}),
+        _replace_job(env={"PATH": "/tmp/attacker"}),
+        _replace_job(env={"BASH_ENV": "/tmp/attacker"}),
+        _replace_workflow(defaults={"run": {"shell": "/tmp/attacker {0}"}}),
+        _replace_job(defaults={"run": {"shell": "/tmp/attacker {0}"}}),
+        _replace_job(container="attacker/image:latest"),
+        _replace_job(
+            services={"poison": {"image": "attacker/image:latest"}},
         ),
-        (
+        _replace_job(**{"runs-on": "self-hosted"}),
+        _replace_job(environment="attacker"),
+        _replace_workflow(permissions={"contents": "write"}),
+        _replace_workflow(
+            permissions={**_EXPECTED_PERMISSIONS, "id-token": "write"},
+        ),
+        _omit_workflow_key("permissions"),
+        _add_job(
+            "attacker",
+            {"runs-on": "ubuntu-latest", "steps": [{"run": "true"}]},
+        ),
+        _replace_job(name="Drifted publisher"),
+        _replace_job(**{"if": "always()"}),
+        _replace_job(**{"timeout-minutes": 60}),
+    ],
+    ids=[
+        "workflow_path",
+        "workflow_bash_env",
+        "job_path",
+        "job_bash_env",
+        "workflow_defaults",
+        "job_defaults",
+        "job_container",
+        "job_services",
+        "runner_drift",
+        "environment_drift",
+        "permissions_drift",
+        "permissions_expansion",
+        "permissions_missing",
+        "unexpected_second_job",
+        "job_name_drift",
+        "job_if_drift",
+        "job_timeout_drift",
+    ],
+)
+def test_exact_publisher_graph_rejects_execution_envelope_drift(workflow):
+    with pytest.raises(AssertionError):
+        _assert_exact_publisher_graph(workflow)
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        _replace_step(0, uses="actions/checkout@v6"),
+        _omit_step(0),
+        _replace_step(
+            0,
+            uses="actions/checkout@0000000000000000000000000000000000000000",
+        ),
+        _replace_step(
+            0,
+            **{
+                "with": {
+                    "ref": "${{ github.event.workflow_run.head_sha }}",
+                    "persist-credentials": False,
+                }
+            },
+        ),
+        _replace_step(
+            0,
+            **{
+                "with": {
+                    "ref": "${{ github.event.repository.default_branch }}",
+                    "persist-credentials": True,
+                }
+            },
+        ),
+        _replace_step(
+            0,
+            **{"with": {"ref": "${{ github.event.repository.default_branch }}"}},
+        ),
+        _insert_step(0, {"uses": "attacker/path-hijack-action@0123456789abcdef"}),
+        _insert_step(1, {"run": "printf 'prepare publisher'"}),
+        _replace_step(
+            1,
+            run="gh extension install drogers0/gh-image --pin v1.2.0",
+        ),
+        _replace_step(1, env={"GH_TOKEN": "${{ secrets.OTHER_TOKEN }}"}),
+        _replace_step(
+            1,
+            env={
+                "GH_TOKEN": "${{ github.token }}",
+                "GH_SESSION_TOKEN": "${{ secrets.GH_IMAGE_SESSION_TOKEN }}",
+            },
+        ),
+        _insert_step(2, deepcopy(_EXPECTED_PUBLISH_STEPS[1])),
+        _omit_step(1),
+        _insert_step(
+            2,
             {
                 "run": (
-                    "curl -LO https://example.invalid/gh-image/"
-                    "v1.2.0/gh-image_1.2.0_linux_amd64.tar.gz"
+                    "command gh extension install drogers0/gh-image "
+                    "--pin v1.2.0"
                 )
             },
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
         ),
-        (
+        _insert_step(
+            2,
+            {"run": "g'h' extension install drogers0/gh-image --pin v1.2.0"},
+        ),
+        _insert_step(
+            2,
             {
                 "run": (
-                    "curl -LO https://example.invalid/gh-image/"
-                    "v1.2.1/gh-image_1.2.1_linux_amd64.tar.gz"
+                    "printf x | gh extension install drogers0/gh-image "
+                    "--pin v1.2.0"
                 )
             },
+        ),
+        _insert_step(
+            2,
+            {"run": "(gh extension install drogers0/gh-image --pin v1.2.0)"},
+        ),
+        _insert_step(
+            2,
             {
                 "run": (
-                    f"echo '{_GH_IMAGE_LINUX_AMD64_SHA256}  gh-image' "
-                    "| sha256sum -c -"
+                    "result=$(gh extension install drogers0/gh-image "
+                    "--pin v1.2.0)"
                 )
             },
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
         ),
-        (
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"run": "gh extension install drogers0/gh-image --pin v1.2.0"},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-        ),
-        (
-            {
-                "run": (
-                    "curl -LO https://example.invalid/gh-image/"
-                    f"{_GH_IMAGE_RELEASE_REF}/{_GH_IMAGE_RELEASE_ASSET}"
-                )
-            },
-            {
-                "run": (
-                    f"echo {_GH_IMAGE_LINUX_AMD64_SHA256}; echo sha256sum"
-                )
-            },
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
+        _insert_step(
+            2,
             {
                 "run": (
                     f"{_GH_IMAGE_SOURCE_INSTALL} || "
                     "gh extension install drogers0/gh-image --pin v1.2.0"
                 )
             },
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
         ),
-        (
-            {"run": "gh image upload evidence.png"},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
-            {"run": "command gh image upload evidence.png"},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
-            {"run": "env gh image upload evidence.png"},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
-            {"run": "/usr/bin/gh image upload evidence.png"},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
-            {"run": "/tmp/gh-image upload evidence.png"},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
-            {"run": "printf x | gh image upload evidence.png"},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
-            {"run": "(gh image upload evidence.png)"},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
-            {"run": "result=$(gh image upload evidence.png)"},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
-            {"run": "g'h' image upload evidence.png"},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
-            {"run": "printf 'prepare publisher'"},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-        ),
-        (
+        _insert_step(
+            2,
             {
                 "run": (
-                    f"{_GH_IMAGE_SOURCE_INSTALL}; "
-                    "command gh image upload evidence.png"
+                    "ref=v1.2.0; gh extension install drogers0/gh-image "
+                    '--pin "$ref" --force'
                 )
             },
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
         ),
-        (
+        _insert_step(
+            2,
             {
                 "run": (
-                    f"{_GH_IMAGE_SOURCE_INSTALL}\n"
-                    "if ! true; then command gh image upload evidence.png; fi"
+                    "curl -LO https://example.invalid/gh-image-v1.2.0; "
+                    "install gh-image /usr/local/bin/gh-image"
                 )
             },
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
         ),
-        (
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"run": _GH_IMAGE_SOURCE_INSTALL},
-            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        _insert_step(2, {"uses": "attacker/replace-publisher@0123456789abcdef"}),
+        _insert_step(2, {"run": "printf 'between selection and publisher'"}),
+        _replace_step(
+            2,
+            env={
+                "GH_TOKEN": "${{ github.token }}",
+                "GITHUB_TOKEN": "${{ github.token }}",
+                "GH_SESSION_TOKEN": "${{ secrets.OTHER_SESSION_TOKEN }}",
+                "SOURCE_REPO": "${{ github.repository }}",
+                "SOURCE_RUN_ID": "${{ github.event.workflow_run.id }}",
+            },
         ),
+        _replace_step(2, run=f"{_PUBLISHER_RUN}echo drift\n"),
+        _replace_step(
+            2,
+            run=(
+                "gh extension install drogers0/gh-image --pin v1.2.0 --force; "
+                "gh image evidence.png"
+            ),
+        ),
+        _insert_step(3, deepcopy(_EXPECTED_PUBLISH_STEPS[2])),
+        _omit_step(2),
+        _insert_step(3, {"uses": "attacker/post-publish@0123456789abcdef"}),
+        _insert_step(3, {"run": "gh image evidence.png"}),
     ],
     ids=[
-        "tag_only",
-        "missing_verification",
-        "digest_ref_mismatch",
-        "later_downgrade",
-        "verification_after_token_exposure",
-        "no_op_digest",
-        "same_step_tag_fallback",
-        "execution_before_pin",
-        "command_wrapper_before_pin",
-        "env_wrapper_before_pin",
-        "path_qualified_gh_before_pin",
-        "path_qualified_gh_image_before_pin",
-        "pipeline_before_pin",
-        "subshell_before_pin",
-        "command_substitution_before_pin",
-        "obfuscated_preselection_run",
-        "unrelated_nonempty_run_before_selection",
-        "same_step_execution_after_install",
-        "conditional_fallback_after_install",
-        "duplicate_immutable_selection",
+        "mutable_checkout",
+        "missing_checkout",
+        "wrong_checkout",
+        "checkout_ref_drift",
+        "checkout_persist_credentials_drift",
+        "checkout_persist_credentials_missing",
+        "review_executable_action_before_selection",
+        "command_before_install",
+        "source_pin_drift",
+        "install_env_drift",
+        "token_before_selection",
+        "duplicate_install",
+        "selector_omission",
+        "review_wrapped_later_downgrade",
+        "quoted_later_downgrade",
+        "pipeline_later_downgrade",
+        "subshell_later_downgrade",
+        "command_substitution_later_downgrade",
+        "fallback_later_downgrade",
+        "review_variable_based_later_downgrade",
+        "binary_replacement",
+        "action_after_selection",
+        "extra_command_between_selection_and_publisher",
+        "privileged_env_drift",
+        "privileged_script_drift",
+        "review_downgrade_inside_token_bearing_step",
+        "publisher_duplication",
+        "publisher_omission",
+        "executable_action_post_publisher",
+        "executable_command_post_publisher",
     ],
 )
-def test_gh_image_identity_audit_rejects_unsafe_workflow_shapes(steps):
+def test_exact_publisher_graph_rejects_unsafe_workflow_shapes(workflow):
     with pytest.raises(AssertionError):
-        _assert_gh_image_identity_is_verified_before_privilege(
-            _workflow_with_steps(*steps)
-        )
+        _assert_exact_publisher_graph(workflow)
 
 
 def _png(width: int = 4, height: int = 3) -> bytes:
