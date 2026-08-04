@@ -16492,9 +16492,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Read model + compression config from config.yaml. Gateway
             # hygiene is a pre-agent safety net for sessions that grew too
-            # large between turns. By default it follows the agent compression
-            # threshold; operators may explicitly configure a separate valid
-            # hygiene_threshold when they need a different gateway trigger.
+            # large between turns. By default it follows the complete effective
+            # agent policy; operators may configure a valid hygiene_threshold
+            # to replace only that policy's percentage-selection stages.
             _hyg_model = "anthropic/claude-sonnet-4.6"
             _hyg_threshold_pct = 0.50
             _hyg_agent_threshold = None
@@ -16539,9 +16539,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_max_tokens = _model_cfg.get("max_tokens")
 
                     # Read compression settings. A valid explicit hygiene
-                    # threshold is the only gateway-specific override; an
-                    # invalid override safely leaves the agent threshold in
-                    # effect.
+                    # threshold replaces the inherited percentage-selection
+                    # stages only; shared window floors, reservations, guards,
+                    # corrections, and caps still apply. Missing or invalid
+                    # values retain the complete effective agent policy.
                     _comp_cfg = _hyg_data.get("compression", {})
                     if isinstance(_comp_cfg, dict):
                         _hyg_compression_enabled = str(
@@ -16744,13 +16745,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     _approx_tokens = estimate_messages_tokens_rough(history)
                     _token_source = "estimated"
-                    # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
-                    # sessions, but that just means hygiene fires a bit early — which
-                    # is safe and harmless.  The 85% threshold already provides ample
-                    # headroom (agent's own compressor runs at 50%).  A previous 1.4x
-                    # multiplier tried to compensate by inflating the threshold, but
-                    # 85% * 1.4 = 119% of context — which exceeds the model's limit
-                    # and prevented hygiene from ever firing for ~200K models (GLM-5).
+                    # Rough estimates can overestimate code/JSON-heavy sessions, so
+                    # hygiene may fire early. Do not inflate the effective policy
+                    # boundary to compensate: that can move the trigger beyond the
+                    # model window and prevent hygiene from firing at all.
 
                 # Hard safety valve: force compression if message count is
                 # extreme, regardless of token estimates.  This breaks the

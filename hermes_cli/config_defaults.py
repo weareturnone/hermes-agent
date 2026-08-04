@@ -578,6 +578,10 @@ DEFAULT_CONFIG = {
                                       # triggers at the lower of the ratio-based
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
+        "hygiene_threshold": None,    # gateway pre-agent hygiene inherits the complete
+                                      # effective agent policy by default. A finite
+                                      # value strictly between 0 and 1 overrides only
+                                      # its percentage-selection stages.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to
