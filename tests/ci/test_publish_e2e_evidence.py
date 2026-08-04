@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -25,6 +26,66 @@ _WORKFLOW_PATH = (
     / "workflows"
     / "publish-e2e-evidence.yml"
 )
+_YAML_BOOL_TAG = "tag:yaml.org,2002:bool"
+_YAML_12_BOOL_PATTERN = re.compile(
+    r"^(?:true|True|TRUE|false|False|FALSE)$"
+)
+_TRIGGER_SOURCE = (
+    "on:\n"
+    "  workflow_run:\n"
+    "    workflows: [CI]\n"
+    "    types: [completed]\n"
+)
+
+
+class _GitHubActionsLoader(yaml.SafeLoader):
+    """Parse Actions YAML keys with isolated YAML 1.2 boolean semantics."""
+
+    yaml_implicit_resolvers = {
+        first_character: [
+            (tag, pattern)
+            for tag, pattern in resolvers
+            if tag != _YAML_BOOL_TAG
+        ]
+        for first_character, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+
+
+_GitHubActionsLoader.add_implicit_resolver(
+    _YAML_BOOL_TAG,
+    _YAML_12_BOOL_PATTERN,
+    list("tTfF"),
+)
+
+
+def _load_workflow_source(source):
+    return yaml.load(source, Loader=_GitHubActionsLoader)
+
+
+def _replace_source_trigger_key(source, replacement):
+    replacement_source = _TRIGGER_SOURCE.replace("on:", f"{replacement}:", 1)
+    mutated, replacements = re.subn(
+        rf"^{re.escape(_TRIGGER_SOURCE)}",
+        replacement_source,
+        source,
+        flags=re.MULTILINE,
+    )
+    assert replacements == 1, "source must contain exactly one top-level on trigger"
+    return mutated
+
+
+def _add_source_trigger_key(source, addition):
+    addition_source = _TRIGGER_SOURCE.replace("on:", f"{addition}:", 1)
+    mutated, replacements = re.subn(
+        rf"^{re.escape(_TRIGGER_SOURCE)}",
+        addition_source + _TRIGGER_SOURCE,
+        source,
+        flags=re.MULTILINE,
+    )
+    assert replacements == 1, "source must contain exactly one top-level on trigger"
+    return mutated
+
+
 _GH_IMAGE_COMMIT = "44f4b93ecbbe22de6c45fa2f62f519aee564ca8c"
 _GH_IMAGE_SOURCE_INSTALL = (
     "gh extension install drogers0/gh-image --pin " f"{_GH_IMAGE_COMMIT}"
@@ -99,7 +160,7 @@ _EXPECTED_PUBLISH_JOB = {
 }
 _COMPLETE_VALID_WORKFLOW = {
     "name": "Publish E2E evidence",
-    True: {
+    "on": {
         "workflow_run": {
             "workflows": ["CI"],
             "types": ["completed"],
@@ -117,7 +178,8 @@ _COMPLETE_VALID_WORKFLOW = {
 def _assert_exact_publisher_graph(workflow):
     """Audit parsed YAML without installing or executing gh-image."""
     assert workflow == _COMPLETE_VALID_WORKFLOW, (
-        "workflow must exactly match the complete reviewed publisher graph"
+        'workflow must preserve literal top-level "on" and exactly match the '
+        "complete reviewed publisher graph"
     )
 
 
@@ -139,31 +201,31 @@ def _omit_workflow_key(key):
 
 def _replace_trigger(trigger):
     workflow = _approved_workflow()
-    workflow[True] = trigger
+    workflow["on"] = trigger
     return workflow
 
 
 def _omit_trigger():
     workflow = _approved_workflow()
-    del workflow[True]
+    del workflow["on"]
     return workflow
 
 
 def _replace_workflow_run(**changes):
     workflow = _approved_workflow()
-    workflow[True]["workflow_run"].update(changes)
+    workflow["on"]["workflow_run"].update(changes)
     return workflow
 
 
 def _omit_workflow_run_key(key):
     workflow = _approved_workflow()
-    del workflow[True]["workflow_run"][key]
+    del workflow["on"]["workflow_run"][key]
     return workflow
 
 
 def _widen_trigger():
     workflow = _approved_workflow()
-    workflow[True]["push"] = {}
+    workflow["on"]["push"] = {}
     return workflow
 
 
@@ -211,9 +273,77 @@ def _expose_job_or_workflow_token(scope):
 
 
 def test_publish_workflow_has_exact_privileged_publisher_graph():
-    workflow = yaml.safe_load(_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    workflow = _load_workflow_source(_WORKFLOW_PATH.read_text(encoding="utf-8"))
 
+    assert "on" in workflow
+    assert isinstance(next(key for key in workflow if key == "on"), str)
+    assert workflow["concurrency"]["cancel-in-progress"] is False
+    assert (
+        workflow["jobs"]["publish"]["steps"][0]["with"]["persist-credentials"]
+        is False
+    )
     _assert_exact_publisher_graph(workflow)
+
+
+def test_github_actions_loader_uses_isolated_yaml_12_boolean_semantics():
+    safe_resolvers = yaml.SafeLoader.yaml_implicit_resolvers
+    custom_resolvers = _GitHubActionsLoader.yaml_implicit_resolvers
+
+    assert custom_resolvers is not safe_resolvers
+    assert all(
+        custom_resolvers[key] is not resolvers
+        for key, resolvers in safe_resolvers.items()
+    )
+    assert yaml.safe_load("on: value") == {True: "value"}
+    assert _load_workflow_source("on: value") == {"on": "value"}
+    assert _load_workflow_source("on: on\noff: off\nyes: yes\nno: no\n") == {
+        "on": "on",
+        "off": "off",
+        "yes": "yes",
+        "no": "no",
+    }
+    for spelling in ("true", "True", "TRUE"):
+        assert _load_workflow_source(f"value: {spelling}")["value"] is True
+    for spelling in ("false", "False", "FALSE"):
+        assert _load_workflow_source(f"value: {spelling}")["value"] is False
+    assert yaml.safe_load("on: value") == {True: "value"}
+
+
+@pytest.mark.parametrize(
+    ("replacement", "case_id"),
+    [
+        ("true", "on_replaced_by_true"),
+        ("yes", "on_replaced_by_yes"),
+    ],
+    ids=["on_replaced_by_true", "on_replaced_by_yes"],
+)
+def test_exact_publisher_graph_rejects_replaced_source_trigger(replacement, case_id):
+    source = _WORKFLOW_PATH.read_text(encoding="utf-8")
+    workflow = _load_workflow_source(
+        _replace_source_trigger_key(source, replacement)
+    )
+
+    assert "on" not in workflow, case_id
+    with pytest.raises(AssertionError, match="literal top-level"):
+        _assert_exact_publisher_graph(workflow)
+
+
+@pytest.mark.parametrize(
+    ("addition", "case_id"),
+    [
+        ("true", "true_key_added_alongside_on"),
+        ("yes", "yes_key_added_alongside_on"),
+    ],
+    ids=["true_key_added_alongside_on", "yes_key_added_alongside_on"],
+)
+def test_exact_publisher_graph_rejects_colliding_source_trigger(addition, case_id):
+    source = _WORKFLOW_PATH.read_text(encoding="utf-8")
+    workflow = _load_workflow_source(_add_source_trigger_key(source, addition))
+
+    assert "on" in workflow, case_id
+    assert len(workflow) == len(_COMPLETE_VALID_WORKFLOW) + 1, case_id
+    with pytest.raises(AssertionError, match="literal top-level"):
+        _assert_exact_publisher_graph(workflow)
 
 
 @pytest.mark.parametrize(
