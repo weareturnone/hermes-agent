@@ -30,6 +30,7 @@ from agent.auxiliary_client import (
     _is_connection_error,
     aux_interrupt_protection,
     call_llm,
+    resolve_effective_compression_threshold,
 )
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -1303,15 +1304,13 @@ def resolve_model_threshold(
     This is a module-level helper so plugin context engines (e.g. LCM) can
     import and reuse the same resolution logic as the built-in compressor.
     """
-    if not model_thresholds or not model:
-        return default
-    best_key = ""
-    for key in model_thresholds:
-        if key in model and len(key) > len(best_key):
-            best_key = key
-    if best_key:
-        return float(model_thresholds[best_key])
-    return default
+    threshold, _ = resolve_effective_compression_threshold(
+        default,
+        model,
+        model_thresholds=model_thresholds,
+        apply_builtin_model_policy=False,
+    )
+    return threshold
 
 
 class ContextCompressor(ContextEngine):
@@ -2157,9 +2156,12 @@ class ContextCompressor(ContextEngine):
         Large-context models keep the configured value — at 512K+ the default
         50% trigger already leaves ample post-compaction headroom.
         """
-        if context_length and context_length < _SMALL_CTX_WINDOW_LIMIT:
-            return max(threshold_percent, _SMALL_CTX_THRESHOLD_PERCENT)
-        return threshold_percent
+        effective, _ = resolve_effective_compression_threshold(
+            threshold_percent,
+            context_length=context_length,
+            apply_builtin_model_policy=False,
+        )
+        return effective
 
     @staticmethod
     def _compute_threshold_tokens(
@@ -2189,19 +2191,13 @@ class ContextCompressor(ContextEngine):
         operate on the effective input budget. ``max_tokens=None`` (provider
         default) conservatively assumes no reservation (full window).
         """
-        effective_window = context_length - (max_tokens or 0)
-        if effective_window <= 0:
-            effective_window = context_length
-        pct_value = int(effective_window * threshold_percent)
-        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
-        # If flooring pushed the threshold to/over the effective window it can
-        # never be reached. Trigger at 85% of the effective input budget so a
-        # minimum-context model rides most of its budget before compacting
-        # instead of wasting half.
-        if effective_window > 0 and floored >= effective_window:
-            return max(1, min(int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO),
-                              effective_window - 1))
-        return floored
+        _, boundary = resolve_effective_compression_threshold(
+            threshold_percent,
+            context_length=context_length,
+            max_tokens=max_tokens,
+            apply_builtin_model_policy=False,
+        )
+        return int(boundary or 0)
     def __init__(
         self,
         model: str,

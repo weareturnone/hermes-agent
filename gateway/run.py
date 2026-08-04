@@ -16485,6 +16485,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # -----------------------------------------------------------------
         if history and len(history) >= 4:
             from agent.model_metadata import (
+                MINIMUM_CONTEXT_LENGTH,
                 estimate_messages_tokens_rough,
                 get_model_context_length_async,
             )
@@ -16496,6 +16497,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # hygiene_threshold when they need a different gateway trigger.
             _hyg_model = "anthropic/claude-sonnet-4.6"
             _hyg_threshold_pct = 0.50
+            _hyg_agent_threshold = None
+            _hyg_explicit_threshold = None
+            _hyg_model_thresholds = None
+            _hyg_threshold_tokens_cap = None
+            _hyg_max_tokens = None
+            _hyg_codex_autoraise = True
             _hyg_compression_enabled = True
             _hyg_hard_msg_limit = 5000
             _hyg_timeout_seconds = 30.0
@@ -16529,6 +16536,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Read provider for accurate context detection
                         _hyg_provider = _model_cfg.get("provider") or None
                         _hyg_base_url = _model_cfg.get("base_url") or None
+                        _hyg_max_tokens = _model_cfg.get("max_tokens")
 
                     # Read compression settings. A valid explicit hygiene
                     # threshold is the only gateway-specific override; an
@@ -16539,14 +16547,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
                         ).lower() in {"true", "1", "yes"}
-                        _raw_threshold = _comp_cfg.get("threshold")
-                        if _raw_threshold is not None:
-                            try:
-                                _parsed_threshold = float(_raw_threshold)
-                                if 0 < _parsed_threshold < 1:
-                                    _hyg_threshold_pct = _parsed_threshold
-                            except (TypeError, ValueError):
-                                pass
+                        _hyg_agent_threshold = _comp_cfg.get("threshold")
+                        _hyg_model_thresholds = _comp_cfg.get(
+                            "model_thresholds"
+                        )
+                        _hyg_threshold_tokens_cap = _comp_cfg.get(
+                            "threshold_tokens"
+                        )
+                        _hyg_codex_autoraise = str(
+                            _comp_cfg.get("codex_gpt55_autoraise", True)
+                        ).lower() in {"true", "1", "yes"}
                         _raw_hygiene_threshold = _comp_cfg.get(
                             "hygiene_threshold"
                         )
@@ -16556,7 +16566,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _raw_hygiene_threshold
                                 )
                                 if 0 < _parsed_hygiene_threshold < 1:
-                                    _hyg_threshold_pct = (
+                                    _hyg_explicit_threshold = (
                                         _parsed_hygiene_threshold
                                     )
                             except (TypeError, ValueError):
@@ -16612,6 +16622,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _hyg_provider = _hyg_runtime.get("provider") or _hyg_provider
                     _hyg_base_url = _hyg_runtime.get("base_url") or _hyg_base_url
                     _hyg_api_key = _hyg_runtime.get("api_key") or _hyg_api_key
+                    _hyg_max_tokens = (
+                        _hyg_runtime.get("max_tokens") or _hyg_max_tokens
+                    )
                 except Exception:
                     pass
 
@@ -16666,9 +16679,58 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     config_context_length=_hyg_config_context_length,
                     provider=_hyg_provider or "",
                 )
-                _compress_token_threshold = int(
-                    _hyg_context_length * _hyg_threshold_pct
-                )
+                try:
+                    from agent.auxiliary_client import (
+                        resolve_effective_compression_threshold,
+                    )
+
+                    if _hyg_explicit_threshold is not None:
+                        (
+                            _hyg_threshold_pct,
+                            _compress_token_threshold,
+                        ) = resolve_effective_compression_threshold(
+                            _hyg_explicit_threshold,
+                            context_length=_hyg_context_length,
+                            max_tokens=_hyg_max_tokens,
+                            threshold_tokens_cap=_hyg_threshold_tokens_cap,
+                            apply_builtin_model_policy=False,
+                        )
+                    else:
+                        (
+                            _hyg_threshold_pct,
+                            _compress_token_threshold,
+                        ) = resolve_effective_compression_threshold(
+                            _hyg_agent_threshold,
+                            _hyg_model,
+                            _hyg_provider,
+                            model_thresholds=(
+                                _hyg_model_thresholds
+                                if isinstance(_hyg_model_thresholds, dict)
+                                else None
+                            ),
+                            context_length=_hyg_context_length,
+                            max_tokens=_hyg_max_tokens,
+                            threshold_tokens_cap=_hyg_threshold_tokens_cap,
+                            allow_codex_gpt55_autoraise=(
+                                _hyg_codex_autoraise
+                            ),
+                        )
+                    _compress_token_threshold = int(
+                        _compress_token_threshold or 0
+                    )
+                    # Metadata probes below Hermes' supported minimum are
+                    # diagnostic/test windows, not real compressor windows.
+                    # Preserve percentage semantics there instead of letting
+                    # the minimum-context guard dominate the entire probe.
+                    if _hyg_context_length < MINIMUM_CONTEXT_LENGTH:
+                        _compress_token_threshold = int(
+                            _hyg_context_length * _hyg_threshold_pct
+                        )
+                except Exception:
+                    _hyg_threshold_pct = 0.50
+                    _compress_token_threshold = int(
+                        _hyg_context_length * _hyg_threshold_pct
+                    )
                 _warn_token_threshold = int(_hyg_context_length * 0.95)
 
                 _msg_count = len(history)

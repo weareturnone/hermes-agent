@@ -724,6 +724,87 @@ def resolve_compression_threshold(
             threshold = model_threshold
     return threshold
 
+
+def resolve_effective_compression_threshold(
+    configured_threshold: Any = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    *,
+    model_thresholds: Optional[dict[str, float]] = None,
+    context_length: Optional[int] = None,
+    max_tokens: Any = None,
+    threshold_tokens_cap: Any = None,
+    allow_codex_gpt55_autoraise: bool = True,
+    apply_builtin_model_policy: bool = True,
+) -> tuple[float, Optional[int]]:
+    """Compose the effective v0.20 compression threshold policy.
+
+    The percentage is resolved in policy order: global configuration,
+    built-in model rules, longest matching user model rule, then the
+    small-window floor. When a context window is supplied, the returned token
+    boundary additionally accounts for output reservation, the minimum-window
+    guard, and the optional absolute token cap.
+
+    ``apply_builtin_model_policy=False`` is for callers whose configured input
+    has already passed through :func:`resolve_compression_threshold` (the stock
+    agent initialization path). It prevents a disabled Codex autoraise from
+    being reintroduced while still sharing every later policy stage.
+    """
+    threshold = resolve_compression_threshold(
+        configured_threshold,
+        model if apply_builtin_model_policy else None,
+        provider if apply_builtin_model_policy else None,
+        allow_codex_gpt55_autoraise=allow_codex_gpt55_autoraise,
+    )
+
+    if model_thresholds and model:
+        model_name = str(model)
+        best_key = ""
+        for raw_key in model_thresholds:
+            key = str(raw_key)
+            if key in model_name and len(key) > len(best_key):
+                best_key = key
+        if best_key:
+            threshold = float(model_thresholds[best_key])
+
+    if context_length is None:
+        return threshold, None
+
+    try:
+        window = int(context_length)
+    except (TypeError, ValueError):
+        window = 0
+    if window > 0 and window < 512_000:
+        threshold = max(threshold, 0.75)
+
+    try:
+        reservation = int(max_tokens) if max_tokens is not None else 0
+    except (TypeError, ValueError):
+        reservation = 0
+    if reservation <= 0:
+        reservation = 0
+    effective_window = window - reservation
+    if effective_window <= 0:
+        effective_window = window
+
+    percentage_boundary = int(effective_window * threshold)
+    boundary = max(percentage_boundary, MINIMUM_CONTEXT_LENGTH)
+    if effective_window > 0 and boundary >= effective_window:
+        boundary = max(1, min(int(effective_window * 0.85), effective_window - 1))
+
+    try:
+        absolute_cap = (
+            int(threshold_tokens_cap)
+            if threshold_tokens_cap is not None
+            else 0
+        )
+    except (TypeError, ValueError):
+        absolute_cap = 0
+    if absolute_cap > 0:
+        boundary = min(boundary, min(absolute_cap, window))
+
+    return threshold, boundary
+
 # Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
 def _get_aux_model_for_provider(provider_id: str) -> str:
     """Return the cheap auxiliary model for a provider.
