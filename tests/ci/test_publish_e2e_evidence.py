@@ -116,13 +116,8 @@ _COMPLETE_VALID_WORKFLOW = {
 
 def _assert_exact_publisher_graph(workflow):
     """Audit parsed YAML without installing or executing gh-image."""
-    assert workflow.get("permissions") == _EXPECTED_PERMISSIONS, (
-        "workflow permissions must exactly match the reviewed publisher permissions"
-    )
-    assert "env" not in workflow, "workflow env must be absent"
-    assert "defaults" not in workflow, "workflow defaults must be absent"
-    assert workflow.get("jobs") == {"publish": _EXPECTED_PUBLISH_JOB}, (
-        "jobs must contain only the exact reviewed publish execution envelope"
+    assert workflow == _COMPLETE_VALID_WORKFLOW, (
+        "workflow must exactly match the complete reviewed publisher graph"
     )
 
 
@@ -139,6 +134,42 @@ def _replace_workflow(**changes):
 def _omit_workflow_key(key):
     workflow = _approved_workflow()
     del workflow[key]
+    return workflow
+
+
+def _replace_trigger(trigger):
+    workflow = _approved_workflow()
+    workflow[True] = trigger
+    return workflow
+
+
+def _omit_trigger():
+    workflow = _approved_workflow()
+    del workflow[True]
+    return workflow
+
+
+def _replace_workflow_run(**changes):
+    workflow = _approved_workflow()
+    workflow[True]["workflow_run"].update(changes)
+    return workflow
+
+
+def _omit_workflow_run_key(key):
+    workflow = _approved_workflow()
+    del workflow[True]["workflow_run"][key]
+    return workflow
+
+
+def _widen_trigger():
+    workflow = _approved_workflow()
+    workflow[True]["push"] = {}
+    return workflow
+
+
+def _replace_concurrency(**changes):
+    workflow = _approved_workflow()
+    workflow["concurrency"].update(changes)
     return workflow
 
 
@@ -194,6 +225,60 @@ def test_publish_workflow_has_exact_privileged_publisher_graph():
 )
 def test_exact_publisher_graph_accepts_approved_shape(workflow):
     _assert_exact_publisher_graph(workflow)
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        _replace_workflow(name="Drifted publisher workflow"),
+        _omit_workflow_key("name"),
+        _replace_workflow_run(workflows=["Attacker CI"]),
+        _omit_workflow_run_key("workflows"),
+        _replace_workflow_run(workflows=["CI", "CI"]),
+        _replace_workflow_run(workflows=["CI", "Attacker CI"]),
+        _replace_trigger({"push": {}}),
+        _omit_trigger(),
+        _widen_trigger(),
+        _replace_workflow_run(types=["requested"]),
+        _omit_workflow_run_key("types"),
+        _replace_workflow_run(types=["completed", "completed"]),
+        _replace_workflow_run(types=["completed", "requested"]),
+        _omit_workflow_key("concurrency"),
+        _replace_concurrency(group="global"),
+        _replace_concurrency(**{"cancel-in-progress": True}),
+        _replace_concurrency(attacker="controlled"),
+        _replace_workflow(**{"run-name": "attacker-controlled"}),
+        _replace_workflow(env={"PATH": "/tmp/attacker"}),
+        _replace_workflow(defaults={"run": {"shell": "/tmp/attacker {0}"}}),
+        _replace_workflow(attacker="controlled"),
+    ],
+    ids=[
+        "workflow_name_changed",
+        "workflow_name_missing",
+        "source_workflow_changed",
+        "source_workflows_missing",
+        "source_workflow_duplicated",
+        "source_workflows_widened",
+        "trigger_replaced_with_push",
+        "trigger_missing",
+        "trigger_additively_widened",
+        "workflow_run_type_changed",
+        "workflow_run_types_missing",
+        "workflow_run_type_duplicated",
+        "workflow_run_types_widened",
+        "concurrency_missing",
+        "concurrency_group_changed",
+        "concurrency_cancellation_changed",
+        "concurrency_extra_key",
+        "unsupported_run_name",
+        "unsupported_workflow_env",
+        "unsupported_workflow_defaults",
+        "unsupported_arbitrary_key",
+    ],
+)
+def test_exact_publisher_graph_rejects_top_level_drift(workflow):
+    with pytest.raises(AssertionError):
+        _assert_exact_publisher_graph(workflow)
 
 
 @pytest.mark.parametrize(
