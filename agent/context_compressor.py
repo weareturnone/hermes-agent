@@ -6281,7 +6281,16 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Skipped when ``force=True`` (manual /compress) so auth/error
         # handling paths are always exercised on explicit user request.
         feasibility_skip = False
-        if not force and self._ineffective_compression_count >= 1:
+        if (
+            not force
+            and current_tokens is None
+            and self._ineffective_compression_count >= 1
+        ):
+            # A supplied current_tokens value is an actual pressure verdict.
+            # Keep the summary path active so a candidate can be judged and,
+            # if it grows, durably rejected. Turning that case into a static
+            # fallback would convert a known growth failure into an apparent
+            # successful boundary and prevent the second strike from latching.
             # _record_compression_regions already estimated this exact window
             # into the telemetry dict above; reuse it so the log line and
             # telemetry can never disagree. The regions helper no-ops when the
@@ -6717,12 +6726,25 @@ This compaction should PRIORITISE preserving all information related to the focu
             and new_estimate >= MINIMUM_CONTEXT_LENGTH
             and saved_estimate <= 0
         ):
-            self._ineffective_compression_count += 1
+            # This candidate never reaches a provider verdict, so commit one
+            # durable anti-thrash strike here. Use the write-through helper to
+            # keep a rebound compressor on the same session in sync.
+            self._record_ineffective_compression_verdict(
+                self._ineffective_compression_count + 1,
+            )
+            # Summary generation and handoff discovery may mutate iterative
+            # summary state. Rejection returns the original transcript object,
+            # so roll those mutations back as part of the same semantic no-op.
+            self._previous_summary = _previous_summary_before_scan
+            self._summary_has_user_turn = _summary_has_user_turn_before_scan
             self._last_compress_aborted = True
+            self._last_compression_made_progress = False
             self._last_summary_error = (
                 "ineffective compression would grow context "
                 f"(~{pre_estimate:,} -> ~{new_estimate:,} tokens)"
             )
+            telemetry["failure_class"] = "ineffective_growth"
+            telemetry["commit_status"] = "rejected"
             if not self.quiet_mode:
                 logger.warning(
                     "Compression rejected: estimated context would grow "
