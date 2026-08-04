@@ -13,6 +13,7 @@ from agent.secret_scope import (
     set_secret_scope,
 )
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 from gateway.config import (
     ChannelOverride,
     GatewayConfig,
@@ -25,6 +26,15 @@ from gateway.config import (
     load_gateway_config,
     persist_home_channel,
 )
+
+
+def test_canonical_defaults_publish_nullable_hygiene_threshold():
+    compression = DEFAULT_CONFIG["compression"]
+
+    assert "hygiene_threshold" in compression, (
+        "canonical compression defaults must publish hygiene_threshold: null"
+    )
+    assert compression["hygiene_threshold"] is None
 
 
 class TestHomeChannelRoundtrip:

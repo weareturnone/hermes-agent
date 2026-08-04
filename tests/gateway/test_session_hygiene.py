@@ -91,6 +91,7 @@ async def _observe_hygiene_compression(
     stored_tokens,
     context_length,
     runtime=None,
+    config_updates=None,
 ):
     """Drive the real gateway hygiene boundary with an inert fake agent."""
     fake_dotenv = types.ModuleType("dotenv")
@@ -195,8 +196,18 @@ async def _observe_hygiene_compression(
         ),
         message_id="1",
     )
-    assert await runner._handle_message(event) == "ok"
-    return FakeCompressAgent.last_instance is not None
+    observations = []
+    turns = [(config, stored_tokens), *(config_updates or [])]
+    for turn_config, turn_tokens in turns:
+        (tmp_path / "config.yaml").write_text(json.dumps(turn_config))
+        entry.last_prompt_tokens = turn_tokens
+        FakeCompressAgent.last_instance = None
+        assert await runner._handle_message(event) == "ok"
+        observations.append(FakeCompressAgent.last_instance is not None)
+
+    if config_updates is None:
+        return observations[0]
+    return observations
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1132,40 @@ async def test_session_hygiene_applies_model_threshold_override(monkeypatch, tmp
     ("case", "config", "context_length", "boundary", "runtime"),
     [
         (
+            "global_threshold",
+            {
+                "model": {
+                    "default": "generic/1m",
+                    "context_length": 1_000_000,
+                },
+                "compression": {
+                    "enabled": True,
+                    "threshold": 0.50,
+                    "hygiene_threshold": None,
+                },
+            },
+            1_000_000,
+            500_000,
+            {},
+        ),
+        (
+            "built_in_model_rule",
+            {
+                "model": {
+                    "default": "openrouter/trinity-large-thinking",
+                    "context_length": 1_000_000,
+                },
+                "compression": {
+                    "enabled": True,
+                    "threshold": 0.95,
+                    "hygiene_threshold": None,
+                },
+            },
+            1_000_000,
+            750_000,
+            {},
+        ),
+        (
             "longest_user_model_match",
             {
                 "model": {
@@ -1132,6 +1177,7 @@ async def test_session_hygiene_applies_model_threshold_override(monkeypatch, tmp
                     "enabled": True,
                     "threshold": 0.50,
                     "model_thresholds": {"glm": 0.65, "glm-5.2-1m": 0.90},
+                    "hygiene_threshold": None,
                 },
             },
             1_000_000,
@@ -1146,7 +1192,11 @@ async def test_session_hygiene_applies_model_threshold_override(monkeypatch, tmp
                     "context_length": 200_000,
                     "max_tokens": 50_000,
                 },
-                "compression": {"enabled": True, "threshold": 0.75},
+                "compression": {
+                    "enabled": True,
+                    "threshold": 0.75,
+                    "hygiene_threshold": None,
+                },
             },
             200_000,
             112_500,
@@ -1163,17 +1213,38 @@ async def test_session_hygiene_applies_model_threshold_override(monkeypatch, tmp
                     "enabled": True,
                     "threshold": 0.90,
                     "threshold_tokens": 600_000,
+                    "hygiene_threshold": None,
                 },
             },
             1_000_000,
             600_000,
             {},
         ),
+        (
+            "small_window_floor",
+            {
+                "model": {
+                    "default": "generic/200k",
+                    "context_length": 200_000,
+                },
+                "compression": {
+                    "enabled": True,
+                    "threshold": 0.50,
+                    "hygiene_threshold": None,
+                },
+            },
+            200_000,
+            150_000,
+            {},
+        ),
     ],
     ids=[
+        "global_threshold",
+        "built_in_model_rule",
         "longest_user_model_match",
         "output_reservation",
         "absolute_token_cap",
+        "small_window_floor",
     ],
 )
 async def test_session_hygiene_uses_same_effective_agent_boundary(
@@ -1196,6 +1267,42 @@ async def test_session_hygiene_uses_same_effective_agent_boundary(
         f"{case}: gateway hygiene must stay below the agent boundary at "
         f"{boundary - 1:,} tokens and trigger at {boundary:,}; observed "
         f"compression decisions {observations}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_reloads_nullable_override_without_restart(
+    monkeypatch, tmp_path
+):
+    inherited = {
+        "model": {"default": "generic/model", "context_length": 1_000_000},
+        "compression": {
+            "enabled": True,
+            "threshold": 0.90,
+            "hygiene_threshold": None,
+        },
+    }
+    explicit = {
+        "model": {"default": "generic/model", "context_length": 1_000_000},
+        "compression": {
+            "enabled": True,
+            "threshold": 0.90,
+            "hygiene_threshold": 0.60,
+        },
+    }
+
+    observations = await _observe_hygiene_compression(
+        monkeypatch,
+        tmp_path,
+        config=inherited,
+        stored_tokens=600_000,
+        context_length=1_000_000,
+        config_updates=[(explicit, 600_000), (inherited, 600_000)],
+    )
+
+    assert observations == [False, True, False], (
+        "one running GatewayRunner must reload null -> explicit -> null "
+        f"hygiene policy changes between messages; observed {observations}"
     )
 
 
