@@ -2462,6 +2462,37 @@ class TestTokenBudgetTailProtection:
             )
             return c
 
+    class _CompressionVerdictStore:
+        """Tiny durable-state fake; no filesystem or provider state involved."""
+
+        def __init__(self):
+            self.counts = {}
+            self.writes = []
+
+        def get_compression_failure_cooldown(self, _session_id):
+            return None
+
+        def get_compression_ineffective_count(self, session_id):
+            return self.counts.get(session_id, 0)
+
+        def set_compression_ineffective_count(self, session_id, count):
+            self.counts[session_id] = count
+            self.writes.append((session_id, count))
+
+    @staticmethod
+    def _pressure_messages():
+        messages = [{"role": "system", "content": "System prompt"}]
+        for i in range(12):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"Message {i}"})
+        return messages
+
+    @staticmethod
+    def _prepare_growth_candidate(compressor):
+        compressor.protect_first_n = 1
+        compressor.protect_last_n = 3
+        compressor.tail_token_budget = 500
+
     def test_large_tool_outputs_no_longer_block_compaction(self, budget_compressor):
         """The motivating scenario: 20 messages with large tool outputs should
         NOT prevent compaction.  With message-count tail protection they would
@@ -2589,7 +2620,9 @@ class TestTokenBudgetTailProtection:
         # Should have compressed (fewer messages than original)
         assert len(result) < len(messages)
 
-    def test_pressure_compression_rejects_context_growth(self, budget_compressor):
+    def test_pressure_compression_rejects_context_growth_atomically(
+        self, budget_compressor, caplog
+    ):
         """Regression: auto compaction must not rotate into a larger context.
 
         The production failure mode was compaction at ~140-157K tokens yielding
@@ -2599,24 +2632,116 @@ class TestTokenBudgetTailProtection:
         again. Under pressure, reject the candidate instead.
         """
         c = budget_compressor
-        c.protect_first_n = 1
-        c.protect_last_n = 3
-        c.tail_token_budget = 500
-
-        messages = [{"role": "system", "content": "System prompt"}]
-        for i in range(12):
-            role = "user" if i % 2 == 0 else "assistant"
-            messages.append({"role": role, "content": f"Message {i}"})
+        self._prepare_growth_candidate(c)
+        c.quiet_mode = False
+        store = self._CompressionVerdictStore()
+        c.bind_session_state(store, "growth-session")
+        c._previous_summary = "summary owned by the current session"
+        c._summary_has_user_turn = True
+        messages = self._pressure_messages()
 
         huge_summary = "summary " + ("x" * 700_000)
-        with patch.object(c, "_generate_summary", return_value=huge_summary):
+        with caplog.at_level("WARNING", logger="agent.context_compressor"), patch.object(
+            c, "_generate_summary", return_value=huge_summary
+        ):
             result = c.compress(messages, current_tokens=150_000)
 
-        assert result == messages
-        assert c._last_compress_aborted is True
-        assert "would grow context" in c._last_summary_error
-        assert c.compression_count == 0
-        assert c._ineffective_compression_count == 1
+        diagnostic = c._last_summary_error or ""
+        observed = {
+            "returned_original_object": result is messages,
+            "durable_verdict_writes": store.writes,
+            "durable_verdict_count": store.counts.get("growth-session", 0),
+            "compression_count": c.compression_count,
+            "made_progress": c._last_compression_made_progress,
+            "aborted": c._last_compress_aborted,
+            "previous_summary": c._previous_summary,
+            "summary_has_user_turn": c._summary_has_user_turn,
+            "diagnostic_names_growth": "would grow context" in diagnostic,
+            "diagnostic_is_bounded": len(diagnostic) < 256,
+            "diagnostic_omits_generated_summary": huge_summary[:200] not in diagnostic,
+            "warning_is_bounded": bool(caplog.messages)
+            and max(map(len, caplog.messages)) < 512,
+        }
+        assert observed == {
+            "returned_original_object": True,
+            "durable_verdict_writes": [("growth-session", 1)],
+            "durable_verdict_count": 1,
+            "compression_count": 0,
+            "made_progress": False,
+            "aborted": True,
+            "previous_summary": "summary owned by the current session",
+            "summary_has_user_turn": True,
+            "diagnostic_names_growth": True,
+            "diagnostic_is_bounded": True,
+            "diagnostic_omits_generated_summary": True,
+            "warning_is_bounded": True,
+        }, "growth rejection must be one durable, bounded, atomic no-op"
+
+    def test_repeated_growth_rejections_persist_and_stop_automatic_thrash(self):
+        store = self._CompressionVerdictStore()
+        huge_summary = "summary " + ("x" * 700_000)
+
+        def new_compressor():
+            with patch(
+                "agent.context_compressor.get_model_context_length",
+                return_value=200_000,
+            ):
+                compressor = ContextCompressor(
+                    model="test/model",
+                    threshold_percent=0.50,
+                    protect_first_n=2,
+                    protect_last_n=20,
+                    quiet_mode=True,
+                )
+            self._prepare_growth_candidate(compressor)
+            compressor.bind_session_state(store, "growth-session")
+            return compressor
+
+        for expected_count in (1, 2):
+            compressor = new_compressor()
+            messages = self._pressure_messages()
+            with patch.object(
+                compressor, "_generate_summary", return_value=huge_summary
+            ):
+                result = compressor.compress(messages, current_tokens=150_000)
+            assert result is messages
+            assert store.counts.get("growth-session") == expected_count
+
+        rebound = new_compressor()
+        observed = {
+            "persisted_writes": store.writes,
+            "rebound_count": rebound._ineffective_compression_count,
+            "automatic_retry_allowed": rebound.should_compress(
+                rebound.threshold_tokens
+            ),
+        }
+        assert observed == {
+            "persisted_writes": [
+                ("growth-session", 1),
+                ("growth-session", 2),
+            ],
+            "rebound_count": 2,
+            "automatic_retry_allowed": False,
+        }, "durable ineffective verdicts must survive rebind and stop retry thrash"
+
+    def test_successful_pressure_compression_keeps_stock_progress_behavior(
+        self, budget_compressor
+    ):
+        c = budget_compressor
+        self._prepare_growth_candidate(c)
+        store = self._CompressionVerdictStore()
+        c.bind_session_state(store, "success-session")
+        messages = self._pressure_messages()
+
+        with patch.object(c, "_generate_summary", return_value="bounded summary"):
+            result = c.compress(messages, current_tokens=150_000)
+
+        assert result is not messages
+        assert len(result) < len(messages)
+        assert c.compression_count == 1
+        assert c._last_compression_made_progress is True
+        assert c._last_compress_aborted is False
+        assert store.writes == []
 
     def test_prune_with_token_budget(self, budget_compressor):
         """_prune_old_tool_results with protect_tail_tokens respects the budget."""

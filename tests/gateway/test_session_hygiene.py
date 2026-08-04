@@ -11,6 +11,7 @@ when they intentionally want different CLI and messaging behavior.
 """
 
 import importlib
+import json
 import sys
 import types
 from datetime import datetime
@@ -77,6 +78,122 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
+
+
+async def _observe_hygiene_compression(
+    monkeypatch,
+    tmp_path,
+    *,
+    config,
+    stored_tokens,
+    context_length,
+    runtime=None,
+):
+    """Drive the real gateway hygiene boundary with an inert fake agent."""
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    class FakeCompressAgent:
+        last_instance = None
+
+        def __init__(self, **kwargs):
+            type(self).last_instance = self
+            self.session_id = kwargs.get("session_id", "fake-session")
+            self._print_fn = None
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            self.session_id = f"{self.session_id}_compressed"
+            return ([{"role": "assistant", "content": "compressed"}], None)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeCompressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    (tmp_path / "config.yaml").write_text(json.dumps(config))
+    gateway_run = importlib.import_module("gateway.run")
+    GatewayRunner = gateway_run.GatewayRunner
+
+    model_config = config.get("model", {})
+    if isinstance(model_config, str):
+        configured_model = model_config
+        configured_provider = ""
+    else:
+        configured_model = model_config.get("default") or model_config.get("model")
+        configured_provider = model_config.get("provider") or ""
+    effective_runtime = {
+        "provider": configured_provider,
+        "api_key": "test-only-no-network",
+        **(runtime or {}),
+    }
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.TELEGRAM: HygieneCaptureAdapter()}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    entry = SessionEntry(
+        session_key="agent:main:telegram:private:12345",
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="private",
+    )
+    entry.last_prompt_tokens = stored_tokens
+    runner.session_store.get_or_create_session.return_value = entry
+    runner.session_store.load_transcript.return_value = _make_history(6, content_size=20)
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._resolve_session_agent_runtime = lambda **_kwargs: (
+        configured_model,
+        effective_runtime,
+    )
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "test-only-no-network"},
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: context_length,
+    )
+
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="private",
+            user_id="12345",
+        ),
+        message_id="1",
+    )
+    assert await runner._handle_message(event) == "ok"
+    return FakeCompressAgent.last_instance is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1243,6 +1360,161 @@ async def test_session_hygiene_applies_model_threshold_override(monkeypatch, tmp
     assert FakeCompressAgent.last_instance is not None, (
         "Gateway hygiene should apply the trinity-large-thinking model "
         "threshold override of 0.75 instead of following config threshold=0.95"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "config", "context_length", "boundary", "runtime"),
+    [
+        (
+            "longest_user_model_match",
+            {
+                "model": {
+                    "default": "openrouter/glm-5.2-1m-preview",
+                    "provider": "openrouter",
+                    "context_length": 1_000_000,
+                },
+                "compression": {
+                    "enabled": True,
+                    "threshold": 0.50,
+                    "model_thresholds": {"glm": 0.65, "glm-5.2-1m": 0.90},
+                },
+            },
+            1_000_000,
+            900_000,
+            {},
+        ),
+        (
+            "output_reservation",
+            {
+                "model": {
+                    "default": "generic/200k",
+                    "context_length": 200_000,
+                    "max_tokens": 50_000,
+                },
+                "compression": {"enabled": True, "threshold": 0.75},
+            },
+            200_000,
+            112_500,
+            {"max_tokens": 50_000},
+        ),
+        (
+            "absolute_token_cap",
+            {
+                "model": {
+                    "default": "generic/model",
+                    "context_length": 1_000_000,
+                },
+                "compression": {
+                    "enabled": True,
+                    "threshold": 0.90,
+                    "threshold_tokens": 600_000,
+                },
+            },
+            1_000_000,
+            600_000,
+            {},
+        ),
+    ],
+    ids=[
+        "longest_user_model_match",
+        "output_reservation",
+        "absolute_token_cap",
+    ],
+)
+async def test_session_hygiene_uses_same_effective_agent_boundary(
+    monkeypatch, tmp_path, case, config, context_length, boundary, runtime
+):
+    observations = []
+    for stored_tokens in (boundary - 1, boundary):
+        observations.append(
+            await _observe_hygiene_compression(
+                monkeypatch,
+                tmp_path,
+                config=config,
+                stored_tokens=stored_tokens,
+                context_length=context_length,
+                runtime=runtime,
+            )
+        )
+
+    assert observations == [False, True], (
+        f"{case}: gateway hygiene must stay below the agent boundary at "
+        f"{boundary - 1:,} tokens and trigger at {boundary:,}; observed "
+        f"compression decisions {observations}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_hygiene_threshold_is_the_only_gateway_override(
+    monkeypatch, tmp_path
+):
+    config = {
+        "model": {"default": "generic/model", "context_length": 1_000_000},
+        "compression": {
+            "enabled": True,
+            "threshold": 0.90,
+            "hygiene_threshold": 0.60,
+        },
+    }
+
+    observations = []
+    for stored_tokens in (599_999, 600_000):
+        observations.append(
+            await _observe_hygiene_compression(
+                monkeypatch,
+                tmp_path,
+                config=config,
+                stored_tokens=stored_tokens,
+                context_length=1_000_000,
+            )
+        )
+
+    assert observations == [False, True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_override",
+    ["invalid", "nan", "inf", 0, -0.1, 1, 1.1],
+    ids=[
+        "non_numeric",
+        "not_finite_nan",
+        "not_finite_infinity",
+        "zero",
+        "negative",
+        "one",
+        "above_one",
+    ],
+)
+async def test_invalid_hygiene_threshold_falls_back_to_effective_agent_policy(
+    monkeypatch, tmp_path, invalid_override
+):
+    config = {
+        "model": {"default": "generic/model", "context_length": 1_000_000},
+        "compression": {
+            "enabled": True,
+            "threshold": 0.90,
+            "hygiene_threshold": invalid_override,
+        },
+    }
+
+    observations = []
+    for stored_tokens in (899_999, 900_000):
+        observations.append(
+            await _observe_hygiene_compression(
+                monkeypatch,
+                tmp_path,
+                config=config,
+                stored_tokens=stored_tokens,
+                context_length=1_000_000,
+            )
+        )
+
+    assert observations == [False, True], (
+        f"invalid hygiene override {invalid_override!r} must fall back to the "
+        f"effective 900,000-token agent boundary; observed {observations}"
     )
 
 
