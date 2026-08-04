@@ -31,20 +31,51 @@ _GH_IMAGE_LINUX_AMD64_SHA256 = (
 )
 _GH_IMAGE_RELEASE_REF = "v1.2.0"
 _GH_IMAGE_RELEASE_ASSET = "gh-image_1.2.0_linux_amd64.tar.gz"
+_GH_IMAGE_SOURCE_INSTALL = (
+    "gh extension install drogers0/gh-image --pin " f"{_GH_IMAGE_COMMIT}"
+)
+_GH_IMAGE_BINARY_CHECKSUM = (
+    "set -euo pipefail\n"
+    f"echo '{_GH_IMAGE_LINUX_AMD64_SHA256}  {_GH_IMAGE_RELEASE_ASSET}' "
+    "| sha256sum -c -"
+)
 
 
-def _shell_commands(run):
-    return [
-        command.strip()
-        for command in re.split(r"(?:\n|;|&&|\|\|)", run)
-        if command.strip()
-    ]
+def _is_approved_binary_download(run):
+    lines = run.splitlines()
+    if len(lines) != 2 or lines[0] != "set -euo pipefail":
+        return False
 
-
-def _is_gh_image_execution(command):
     return bool(
-        re.match(r"^gh\s+image(?:\s|$)", command)
-        or re.match(r"^(?:\S+/)?gh-image(?:\s|$)", command)
+        re.fullmatch(
+            rf"curl -LO https://[A-Za-z0-9.-]+(?:/[A-Za-z0-9._~-]+)*/"
+            rf"{re.escape(_GH_IMAGE_RELEASE_REF)}/"
+            rf"{re.escape(_GH_IMAGE_RELEASE_ASSET)}",
+            lines[1],
+        )
+    )
+
+
+def _is_source_install_attempt(run):
+    return bool(
+        re.fullmatch(
+            r"gh extension install drogers0/gh-image --pin [^\s]+",
+            run,
+        )
+    )
+
+
+def _is_binary_download_attempt(run):
+    lines = run.splitlines()
+    if len(lines) != 2 or lines[0] != "set -euo pipefail":
+        return False
+
+    return bool(
+        re.fullmatch(
+            r"curl -LO https://[A-Za-z0-9.-]+(?:/[A-Za-z0-9._~-]+)*/"
+            r"gh-image[^\s/]*",
+            lines[1],
+        )
     )
 
 
@@ -55,67 +86,12 @@ def _assert_gh_image_identity_is_verified_before_privilege(workflow):
     assert "GH_SESSION_TOKEN" not in job.get("env", {})
 
     immutable_identity = False
-    downloaded_accepted_binary = False
-    saw_identity_selection = False
     identity_selections = 0
+    binary_download_pending = False
 
     for step in job["steps"]:
-        run = str(step.get("run", ""))
-
-        for command in _shell_commands(run):
-            if _is_gh_image_execution(command):
-                assert immutable_identity, (
-                    "gh-image must not execute before its immutable identity "
-                    "has been verified"
-                )
-
-            if "gh extension install" in command and "gh-image" in command:
-                identity_selections += 1
-                saw_identity_selection = True
-                pins = re.findall(r"--pin(?:=|\s+)([^\s]+)", command)
-                immutable_identity = (
-                    identity_selections == 1
-                    and pins == [_GH_IMAGE_COMMIT]
-                    and "||" not in run
-                )
-                assert immutable_identity, (
-                    "gh-image execution identity must be immutable and verified "
-                    "before GH_SESSION_TOKEN exposure"
-                )
-
-            if (
-                "http" in command
-                and _GH_IMAGE_RELEASE_REF in command
-                and _GH_IMAGE_RELEASE_ASSET in command
-            ):
-                identity_selections += 1
-                saw_identity_selection = True
-                assert identity_selections == 1, (
-                    "gh-image must have exactly one immutable identity selection"
-                )
-                downloaded_accepted_binary = True
-                immutable_identity = False
-
-            if "sha256sum" in command:
-                checksum_comparison = re.search(
-                    r"sha256sum\s+(?:--check|-c)(?:\s|$)", command
-                )
-                checksum_binding = re.search(
-                    rf"{_GH_IMAGE_LINUX_AMD64_SHA256}\s+\*?"
-                    rf"{re.escape(_GH_IMAGE_RELEASE_ASSET)}(?:\s|['\"]|$)",
-                    command,
-                )
-                immutable_identity = bool(
-                    downloaded_accepted_binary
-                    and checksum_comparison
-                    and checksum_binding
-                    and "set -euo pipefail" in run
-                    and "||" not in run
-                )
-                assert immutable_identity, (
-                    "gh-image binary must use a fail-closed checksum comparison "
-                    "bound to the accepted release artifact"
-                )
+        run_value = step.get("run")
+        run = "" if run_value is None else str(run_value)
 
         if "GH_SESSION_TOKEN" in step.get("env", {}):
             assert immutable_identity, (
@@ -123,7 +99,42 @@ def _assert_gh_image_identity_is_verified_before_privilege(workflow):
                 "immutable, fail-closed execution identity"
             )
 
-    assert saw_identity_selection, "workflow must select a verified gh-image identity"
+        if binary_download_pending:
+            assert run == _GH_IMAGE_BINARY_CHECKSUM, (
+                "gh-image binary selection must immediately use the exact "
+                "fail-closed checksum step"
+            )
+            binary_download_pending = False
+            immutable_identity = True
+            continue
+
+        if not immutable_identity:
+            if run == _GH_IMAGE_SOURCE_INSTALL:
+                identity_selections += 1
+                immutable_identity = True
+                continue
+
+            if _is_approved_binary_download(run):
+                identity_selections += 1
+                binary_download_pending = True
+                continue
+
+            assert not run, (
+                "every non-empty run step before gh-image identity selection "
+                "must exactly match one reviewed immutable install shape"
+            )
+            continue
+
+        assert not (
+            _is_source_install_attempt(run) or _is_binary_download_attempt(run)
+        ), "gh-image must have exactly one immutable identity selection"
+
+    assert not binary_download_pending, (
+        "gh-image binary selection is incomplete without exact checksum verification"
+    )
+    assert identity_selections == 1, (
+        "workflow must select exactly one verified gh-image identity"
+    )
 
 
 def _workflow_with_steps(*steps):
@@ -140,12 +151,10 @@ def test_publish_workflow_verifies_immutable_gh_image_before_privileged_token():
     "steps",
     [
         (
-            {
-                "run": (
-                    "gh extension install drogers0/gh-image "
-                    f"--pin {_GH_IMAGE_COMMIT}"
-                )
-            },
+            {"uses": "actions/checkout@immutable"},
+            {},
+            {"run": ""},
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
             {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
         ),
         (
@@ -156,14 +165,7 @@ def test_publish_workflow_verifies_immutable_gh_image_before_privileged_token():
                     f"{_GH_IMAGE_RELEASE_REF}/{_GH_IMAGE_RELEASE_ASSET}"
                 )
             },
-            {
-                "run": (
-                    "set -euo pipefail\n"
-                    f"echo '{_GH_IMAGE_LINUX_AMD64_SHA256}  "
-                    f"{_GH_IMAGE_RELEASE_ASSET}' "
-                    "| sha256sum -c -"
-                )
-            },
+            {"run": _GH_IMAGE_BINARY_CHECKSUM},
             {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
         ),
     ],
@@ -207,23 +209,13 @@ def test_gh_image_identity_audit_accepts_approved_workflow_shapes(steps):
             {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
         ),
         (
-            {
-                "run": (
-                    "gh extension install drogers0/gh-image "
-                    f"--pin {_GH_IMAGE_COMMIT}"
-                )
-            },
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
             {"run": "gh extension install drogers0/gh-image --pin v1.2.0"},
             {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
         ),
         (
             {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
-            {
-                "run": (
-                    "gh extension install drogers0/gh-image "
-                    f"--pin {_GH_IMAGE_COMMIT}"
-                )
-            },
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
         ),
         (
             {
@@ -242,8 +234,7 @@ def test_gh_image_identity_audit_accepts_approved_workflow_shapes(steps):
         (
             {
                 "run": (
-                    "gh extension install drogers0/gh-image "
-                    f"--pin {_GH_IMAGE_COMMIT} || "
+                    f"{_GH_IMAGE_SOURCE_INSTALL} || "
                     "gh extension install drogers0/gh-image --pin v1.2.0"
                 )
             },
@@ -251,12 +242,75 @@ def test_gh_image_identity_audit_accepts_approved_workflow_shapes(steps):
         ),
         (
             {"run": "gh image upload evidence.png"},
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
+            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        ),
+        (
+            {"run": "command gh image upload evidence.png"},
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
+            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        ),
+        (
+            {"run": "env gh image upload evidence.png"},
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
+            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        ),
+        (
+            {"run": "/usr/bin/gh image upload evidence.png"},
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
+            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        ),
+        (
+            {"run": "/tmp/gh-image upload evidence.png"},
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
+            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        ),
+        (
+            {"run": "printf x | gh image upload evidence.png"},
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
+            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        ),
+        (
+            {"run": "(gh image upload evidence.png)"},
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
+            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        ),
+        (
+            {"run": "result=$(gh image upload evidence.png)"},
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
+            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        ),
+        (
+            {"run": "g'h' image upload evidence.png"},
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
+            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        ),
+        (
+            {"run": "printf 'prepare publisher'"},
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
+            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        ),
+        (
             {
                 "run": (
-                    "gh extension install drogers0/gh-image "
-                    f"--pin {_GH_IMAGE_COMMIT}"
+                    f"{_GH_IMAGE_SOURCE_INSTALL}; "
+                    "command gh image upload evidence.png"
                 )
             },
+            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        ),
+        (
+            {
+                "run": (
+                    f"{_GH_IMAGE_SOURCE_INSTALL}\n"
+                    "if ! true; then command gh image upload evidence.png; fi"
+                )
+            },
+            {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
+        ),
+        (
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
+            {"run": _GH_IMAGE_SOURCE_INSTALL},
             {"env": {"GH_SESSION_TOKEN": "secret"}, "run": "publish"},
         ),
     ],
@@ -269,6 +323,18 @@ def test_gh_image_identity_audit_accepts_approved_workflow_shapes(steps):
         "no_op_digest",
         "same_step_tag_fallback",
         "execution_before_pin",
+        "command_wrapper_before_pin",
+        "env_wrapper_before_pin",
+        "path_qualified_gh_before_pin",
+        "path_qualified_gh_image_before_pin",
+        "pipeline_before_pin",
+        "subshell_before_pin",
+        "command_substitution_before_pin",
+        "obfuscated_preselection_run",
+        "unrelated_nonempty_run_before_selection",
+        "same_step_execution_after_install",
+        "conditional_fallback_after_install",
+        "duplicate_immutable_selection",
     ],
 )
 def test_gh_image_identity_audit_rejects_unsafe_workflow_shapes(steps):
