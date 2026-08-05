@@ -784,8 +784,9 @@ All compression settings live in `config.yaml` (no environment variables).
 compression:
   enabled: true                                     # Toggle compression on/off
   progress_notices: false                           # Opt-in: deliver routine compression progress notices to chat platforms — see below
-  threshold: 0.50                                   # Compress at this % of context limit
+  threshold: 0.50                                   # Raw global percentage before effective-policy composition
   threshold_tokens: null                            # Absolute token cap (optional) — takes lower of ratio vs absolute
+  hygiene_threshold: null                           # Gateway inherits the complete effective agent policy; valid (0,1) overrides percentage selection only
   target_ratio: 0.20                                # Fraction of threshold to preserve as recent tail
   protect_last_n: 20                                # Min recent messages to keep uncompressed
   protect_first_n: 3                                # Non-system head messages pinned across compactions (0 = pin nothing)
@@ -829,13 +830,33 @@ Older configs with `compression.summary_model`, `compression.summary_provider`, 
 
 `protect_first_n` controls how many **non-system** head messages are pinned across every compaction. Default `3` — the opening user/assistant exchange survives every summarizer pass so the original goal stays visible. On long-running rolling-compaction sessions where the opening turn is no longer relevant, set `protect_first_n: 0` to pin nothing but the system prompt + summary + tail. The system prompt itself is always preserved regardless of this setting.
 
-`in_place` (default `true`) controls what happens to the session identity when compaction fires. When `true`, compaction rewrites the message list and rebuilds the system prompt **without rotating the session id** — the conversation keeps one durable id for its whole life (no `parent_session_id` chain, no `name #2` / `#3` renumbering in session lists). Compaction is non-destructive: the live context is compacted, but the pre-compaction turns are soft-archived under the same id (marked inactive/compacted) — still searchable via `session_search` and recoverable, not deleted. Hooks see the mode via the `in_place` field on the `session:compress` event. Set `in_place: false` to restore the legacy behavior where each compaction rotates to a new session id linked to the old one.
+`in_place` (default `true`) controls what happens to the session identity when compaction fires. When `true`, compaction rewrites the message list and rebuilds the system prompt **without rotating the session id** — the conversation keeps one durable id for its whole life (no `parent_session_id` chain, no `name #2` / `#3` renumbering in session lists). Compaction is non-destructive: the live context is compacted, but the pre-compaction turns are soft-archived under the same id (marked inactive/compacted) — still searchable via `session_search` and recoverable, not deleted. Hooks see the mode via the `in_place` field on the `session:compress` event. Set `in_place: false` to restore the legacy rotating behavior for normal or manual in-agent compaction, where each compaction creates a new session id linked to the old one. Gateway pre-agent hygiene always forces in-place compaction for routing safety, regardless of this setting.
 
 `threshold_tokens` sets an optional **absolute token cap** for the compression trigger. When set, compression fires at the lower of the ratio-based `threshold` and this absolute count — so compression never fires later than the user's preferred token number regardless of which model is active. This solves the problem where switching between models with different context windows (e.g. 1M → 400K) shifts the absolute trigger point. The cap is clamped to the model's context length, so setting it higher than the model supports is safe — the ratio-based threshold is used instead. Default `null` (disabled — ratio-based threshold only). The cap survives model switches and fallback activations.
 
+`threshold: 0.50` is the raw global default, not a universal half-window
+trigger. Hermes selects a percentage from the configured value, built-in
+route/model policy, and the longest matching user `model_thresholds` entry;
+then it composes the raise-only 75% floor for windows below 512K, output-token
+reservation, the minimum-window guard and safety correction, and any positive
+`threshold_tokens` cap into the effective token boundary. See
+[Context Compression and Caching](/developer-guide/context-compression-and-caching#gateway-hygiene-policy-and-overrides)
+for the resolution order.
+
+`hygiene_threshold` (default `null`) controls only gateway pre-agent hygiene's
+percentage selection. Missing or `null` inherits the complete effective agent
+policy. A finite numeric value strictly inside `(0, 1)` replaces only the
+global/model/route/user percentage-selection stages; the small-window floor,
+output reservation, guards, safety correction, and token cap still apply.
+Invalid values — including non-numeric or non-finite values, booleans, `0`, `1`,
+out-of-range values, lists, and mappings — safely inherit the complete policy
+without rewriting `config.yaml`. The gateway reloads this setting for every
+inbound message, so `null` → explicit → `null` takes effect on the next
+messages without a restart.
+
 `idle_compact_after_seconds` is an **opt-in, time-based** trigger that complements the size-based `threshold`. Default `0` (disabled). When set above 0, a session that resumes after at least that many seconds of inactivity compacts its accumulated history up front, before the first reply — so a long-lived thread (e.g. a Telegram conversation you come back to hours later) doesn't re-read its full stale context on every subsequent turn. It never fires when the context is already at or below the post-compression target (`threshold × target_ratio`), and it honors the same failure-cooldown, anti-thrash, and per-session lock guards as every automatic compaction. Example: `idle_compact_after_seconds: 1800` compacts after 30 minutes idle.
 
-`proactive_prune_tokens` enables a deterministic, no-LLM prune of old tool-result payloads that runs independently of `threshold`. On large-window models the `threshold` compaction (≈50% of the window) rarely fires, so bulky tool outputs (terminal dumps, file reads, web extracts) ride along in history and get re-sent on every subsequent turn. When re-sent history exceeds `proactive_prune_tokens` (default `0` = off; try `48000` to enable), the prune dedupes identical results, summarizes older oversized ones, and truncates large tool-call arguments — protecting the most recent `protect_last_n` messages and never calling the model. Full outputs stay recoverable from the session store. `proactive_prune_min_result_chars` (default `8000`, clamped to ≥ 200) sets the size below which a tool result is left untouched. `proactive_prune_min_reclaim_tokens` (default `4096`) prevents a prune from committing unless it reclaims at least that many tokens — a committed prune rewrites already-sent history and invalidates the provider's prompt-cache prefix, so this gate keeps those cache breaks episodic and amortized (one meaningful break, like a compression boundary) instead of firing on every tool iteration. This runs only under the built-in `compressor` engine; other context engines inherit a no-op.
+`proactive_prune_tokens` enables a deterministic, no-LLM prune of old tool-result payloads that runs independently of `threshold`. On large-window models, the raw `0.50` default with no route/model/user override or token cap can place compaction around half the window, so bulky tool outputs (terminal dumps, file reads, web extracts) may ride along in history and get re-sent on every subsequent turn. When re-sent history exceeds `proactive_prune_tokens` (default `0` = off; try `48000` to enable), the prune dedupes identical results, summarizes older oversized ones, and truncates large tool-call arguments — protecting the most recent `protect_last_n` messages and never calling the model. Full outputs stay recoverable from the session store. `proactive_prune_min_result_chars` (default `8000`, clamped to ≥ 200) sets the size below which a tool result is left untouched. `proactive_prune_min_reclaim_tokens` (default `4096`) prevents a prune from committing unless it reclaims at least that many tokens — a committed prune rewrites already-sent history and invalidates the provider's prompt-cache prefix, so this gate keeps those cache breaks episodic and amortized (one meaningful break, like a compression boundary) instead of firing on every tool iteration. This runs only under the built-in `compressor` engine; other context engines inherit a no-op.
 
 :::tip Gateway hot-reload of compression and context length
 As of recent releases, editing `model.context_length` or any `compression.*` key in `config.yaml` on a running gateway takes effect on the next message — no gateway restart, no `/reset`, no session rotation required. The cached-agent signature includes these keys, so the gateway transparently rebuilds the agent when it sees a change. API keys and tool/skill config still require the usual reload paths.
@@ -980,30 +1001,15 @@ The **stale stream detection** kills connections that receive SSE keep-alive pin
 
 The **stale non-stream detection** kills non-streaming calls that produce no response for too long. By default Hermes disables this on local endpoints to avoid false positives during long prefills. If you explicitly set `providers.<id>.stale_timeout_seconds`, `providers.<id>.models.<model>.stale_timeout_seconds`, or `HERMES_API_CALL_STALE_TIMEOUT`, that explicit value is honored even on local endpoints.
 
-## Context Pressure Warnings
+## Compression Progress Notices
 
-Separate from iteration budget pressure, context pressure tracks how close the conversation is to the **compaction threshold** — the point where context compression fires to summarize older messages. This helps both you and the agent understand when the conversation is getting long.
-
-| Progress | Level | What happens |
-|----------|-------|-------------|
-| **≥ 60%** to threshold | Info | CLI shows a cyan progress bar; gateway sends an informational notice |
-| **≥ 85%** to threshold | Warning | CLI shows a bold yellow bar; gateway warns compaction is imminent |
-
-In the CLI, context pressure appears as a progress bar in the tool output feed:
-
-```
-  ◐ context ████████████░░░░░░░░ 62% to compaction  48k threshold (50%) · approaching compaction
-```
-
-On messaging platforms, a plain-text notification is sent:
-
-```
-◐ Context: ████████████░░░░░░░░ 62% to compaction (threshold: 50% of window).
-```
-
-If auto-compression is disabled, the warning tells you context may be truncated instead.
-
-Context pressure is automatic — no configuration needed. It fires purely as a user-facing notification and does not modify the message stream or inject anything into the model's context.
+Hermes does not implement fixed 60% or 85% context-pressure warning bars.
+Compression starts when the conversation reaches its effective token boundary.
+With the default `compression.progress_notices: false`, routine lifecycle
+statuses stay silent on chat gateways. Set it to `true` to expose the actual
+compression start, preflight/pre-API trigger, idle compaction, retry, and
+completion statuses. Compression failures and manual `/compress` feedback are
+always visible, even when routine notices are disabled.
 
 ## Credential Pool Strategies
 

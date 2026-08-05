@@ -24,7 +24,7 @@ The SQLite database stores:
 - Full message history (role, content, tool calls, tool results)
 - Token counts (input/output)
 - Timestamps (started_at, ended_at)
-- Parent session ID (for compression-triggered session splitting)
+- Parent session ID (stored lineage and legacy opt-out compression rotation)
 
 ### What Counts Toward Context
 
@@ -258,15 +258,26 @@ hermes sessions rename 20250305_091523_a1b2c3d4 "refactoring auth module"
 - **Sanitized** — control characters, zero-width chars, and RTL overrides are stripped automatically
 - **Normal Unicode is fine** — emoji, CJK, accented characters all work
 
-### Auto-Lineage on Compression
+### Stable Compression Identity and Optional Legacy Lineage
 
-When a session's context is compressed (manually via `/compress` or automatically), Hermes creates a new continuation session. If the original had a title, the new session automatically gets a numbered title:
+By default, `compression.in_place: true` keeps the same session ID when
+automatic or manual compaction runs. Replaced turns are soft-archived as
+inactive/compacted rows under that ID, so they remain searchable and
+recoverable rather than being deleted.
+
+Set `compression.in_place: false` to enable the legacy continuation path for
+normal or manual in-agent compaction. That path creates a child linked through
+`parent_session_id`; if the original had a title, the child gets a numbered
+title:
 
 ```
 "my project" → "my project #2" → "my project #3"
 ```
 
-When you resume by name (`hermes -c "my project"`), it automatically picks the most recent session in the lineage.
+When you resume by name (`hermes -c "my project"`), Hermes automatically picks
+the most recent stored session in that lineage. Gateway pre-agent hygiene is an
+exception to the preference: it always compacts in place for routing safety and
+never creates a continuation child.
 
 ### /title in Messaging Platforms
 
@@ -395,7 +406,7 @@ Pass `--format md` or `--format qmd` when you want a readable, file-based archiv
 # Export one session to Markdown
 hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4
 
-# Export a compression lineage as one logical document
+# Export stored/legacy compression lineage as one logical document
 hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4 --lineage logical
 
 # Preview ended sessions older than 90 days without writing files

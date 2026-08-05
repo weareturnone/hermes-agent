@@ -81,7 +81,8 @@ All compression settings are read from `config.yaml` under the `compression` key
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
-  threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
+  progress_notices: false    # Opt in to routine gateway compression statuses
+  threshold: 0.50            # Raw global percentage before policy composition
   threshold_tokens: null     # Optional absolute token cap on the effective boundary
   hygiene_threshold: null    # Gateway inherits the complete agent policy (default)
   # hygiene_threshold: "0.80"  # Explicit gateway percentage override; numeric strings work
@@ -108,7 +109,8 @@ auxiliary:
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `threshold` | `0.50` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × context_length` |
+| `progress_notices` | `false` | bool | Show routine compression start, preflight/pre-API, idle, retry, and completion statuses on chat gateways. Failure notices and manual `/compress` feedback stay visible either way |
+| `threshold` | `0.50` | 0.0-1.0 | Raw global percentage used as the starting point for the effective boundary |
 | `threshold_tokens` | `null` | positive integer or `null` | Optional absolute token cap; the lower of this cap and the resolved percentage boundary wins |
 | `hygiene_threshold` | `null` | finite value strictly inside `(0, 1)`, or `null` | Gateway-only percentage override. `null` or an invalid value inherits the complete effective agent policy |
 | `model_thresholds` | `{}` | map | Per-model overrides of `threshold`. Keys are substring-matched against the model name (longest match wins). The small-context floor still applies on top (see below) |
@@ -165,7 +167,11 @@ Consumers observe the mode rather than diffing session ids:
 - The `session:compress` event carries `in_place: true/false` and `old_session_id` (empty string in in-place mode, since there is no old id).
 - The gateway re-baselines transcript handling from the agent's rotation-independent `_last_compaction_in_place` flag, not from an id-change diff.
 
-Set `in_place: false` to restore the legacy rotating path, where each compaction commits a new session id linked to the previous one via `parent_session_id`.
+Set `in_place: false` to restore the legacy rotating path for normal or manual
+in-agent compaction, where each compaction commits a new session id linked to
+the previous one via `parent_session_id`. Gateway pre-agent hygiene is the
+exception: it always forces in-place compaction for routing safety and never
+publishes a continuation child, regardless of this preference.
 
 ### Per-model threshold overrides
 
@@ -510,4 +516,16 @@ The CLI shows caching status at startup:
 
 ## Context Pressure Warnings
 
-Intermediate context-pressure warnings have been removed (see the iteration-budget block in `run_agent.py`, which notes: "No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"). Compression fires when prompt tokens reach the effective compression boundary with no prior warning step; gateway session hygiene applies that same effective policy by default as a pre-agent safety checkpoint, or uses a valid explicit `compression.hygiene_threshold` override as described above.
+Intermediate fixed-percentage context-pressure warnings have been removed (see
+the iteration-budget block in `run_agent.py`, which notes: "No intermediate
+pressure warnings — they caused models to 'give up' prematurely on complex
+tasks"). Compression fires when prompt tokens reach the effective compression
+boundary with no 60% or 85% warning-bar step. Gateway session hygiene applies
+that same effective policy by default as a pre-agent safety checkpoint, or uses
+a valid explicit `compression.hygiene_threshold` override as described above.
+
+On chat gateways, `compression.progress_notices: false` keeps routine
+compression progress silent by default. Set it to `true` to show the actual
+start, preflight/pre-API, idle, retry, and completion lifecycle statuses.
+Compression failures and manual `/compress` feedback remain visible regardless
+of this setting.

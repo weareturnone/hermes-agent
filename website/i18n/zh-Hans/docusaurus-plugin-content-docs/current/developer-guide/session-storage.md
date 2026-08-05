@@ -20,7 +20,8 @@ Hermes Agent 使用 SQLite 数据库（`~/.hermes/state.db`）跨 CLI 和 gatewa
 关键设计决策：
 - **WAL 模式**：支持并发读取 + 单写入（gateway 多平台）
 - **FTS5 虚拟表**：跨所有会话消息的快速全文搜索
-- **会话血缘**：通过 `parent_session_id` 链实现（压缩触发的会话分割）
+- **默认稳定压缩身份**：被替换的消息行会以 inactive/compacted 状态软归档在同一 session ID 下
+- **会话血缘**：已存储血缘和旧式 `compression.in_place: false` 普通/手动旋转路径通过 `parent_session_id` 链实现
 - **来源标记**（`cli`、`telegram`、`discord` 等）：用于平台过滤
 - 批量运行器和 RL 轨迹不存储于此（独立系统）
 
@@ -290,7 +291,9 @@ results = db.search_messages("help", role_filter=["user"])
 
 ## 会话血缘
 
-会话可通过 `parent_session_id` 形成链。这发生在 gateway 中上下文压缩触发会话分割时。
+会话可通过 `parent_session_id` 形成链，因此相关 schema、索引、SQL、查询 helper、命名血缘解析和逻辑血缘导出仍受支持。新压缩默认使用 `compression.in_place: true`：session ID 保持不变，被替换的行在同一 ID 下标记为 inactive/compacted，因而仍可搜索、可恢复，而非被删除。
+
+将 `compression.in_place` 设为 `false` 可让普通或手动的 agent 内压缩使用旧式分割，创建链接的子 session。Gateway agent 前清理为路由安全始终强制原地压缩，不会创建子 session。
 
 ### 查询：查找会话血缘
 

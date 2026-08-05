@@ -22,7 +22,7 @@ SQLite 数据库存储：
 - 完整消息历史（角色、内容、工具调用、工具结果）
 - Token 计数（输入/输出）
 - 时间戳（started_at、ended_at）
-- 父 session ID（用于压缩触发的 session 分割）
+- 父 session ID（用于已存储血缘和旧式选择退出压缩旋转）
 
 ### 哪些内容计入上下文
 
@@ -216,15 +216,17 @@ hermes sessions rename 20250305_091523_a1b2c3d4 "refactoring auth module"
 - **净化处理**——控制字符、零宽字符和 RTL 覆盖字符会被自动去除
 - **普通 Unicode 均可**——emoji、CJK 字符、带重音字符均支持
 
-### 压缩时的自动谱系
+### 稳定压缩身份与可选旧式谱系
 
-当 session 的上下文被压缩（通过 `/compress` 手动或自动触发）时，Hermes 会创建一个新的续接 session。如果原 session 有标题，新 session 会自动获得带编号的标题：
+默认 `compression.in_place: true` 使自动或手动压缩保留同一 session ID。被替换的轮次会以 inactive/compacted 行软归档在该 ID 下，因此仍可搜索、可恢复，而非被删除。
+
+将 `compression.in_place` 设为 `false` 可为普通或手动的 agent 内压缩启用旧式续接路径。该路径创建通过 `parent_session_id` 链接的子 session；如果原 session 有标题，子 session 会获得带编号的标题：
 
 ```
 "my project" → "my project #2" → "my project #3"
 ```
 
-按名称恢复时（`hermes -c "my project"`），会自动选取谱系中最新的 session。
+按名称恢复时（`hermes -c "my project"`），Hermes 会自动选取该已存储谱系中最新的 session。Gateway agent 前清理不受该偏好影响；它为路由安全始终原地压缩，不会创建续接子 session。
 
 ### 在消息平台中使用 /title
 
@@ -353,7 +355,7 @@ Trace 导出默认强制脱敏（它们本来就是要离开本机的）；`--no
 # 将单个 session 导出为 Markdown
 hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4
 
-# 将压缩链（compression lineage）导出为一个逻辑文档
+# 将已存储/旧式压缩链（compression lineage）导出为一个逻辑文档
 hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4 --lineage logical
 
 # 预览 90 天前已结束的 session，不写入文件

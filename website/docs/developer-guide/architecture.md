@@ -219,7 +219,12 @@ Central tool registry (`tools/registry.py`) with 70+ registered tools across ~28
 
 ### Session Persistence
 
-SQLite-based session storage with FTS5 full-text search. Sessions have lineage tracking (parent/child across compressions), per-platform isolation, and atomic writes with contention handling.
+SQLite-based session storage with FTS5 full-text search, per-platform isolation,
+and atomic writes with contention handling. Default in-place compaction keeps one
+session ID and soft-archives replaced rows under it. The `parent_session_id`
+schema and lineage helpers remain supported for stored lineage and the legacy
+normal/manual rotation path selected with `compression.in_place: false`;
+gateway pre-agent hygiene always stays in-place for routing safety.
 
 → [Session Storage](./session-storage.md)
 

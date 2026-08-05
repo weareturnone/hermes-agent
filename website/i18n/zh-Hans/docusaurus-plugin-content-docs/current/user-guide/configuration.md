@@ -596,9 +596,13 @@ Hermes 自动压缩长对话以保持在模型的上下文窗口内。压缩摘�
 ```yaml
 compression:
   enabled: true                                     # 开启/关闭压缩
-  threshold: 0.50                                   # 在上下文限制的此百分比时压缩
+  progress_notices: false                           # 选择显示常规 gateway 压缩进度通知
+  threshold: 0.50                                   # 组合有效策略前的原始全局百分比
+  threshold_tokens: null                            # 可选绝对 token 上限；与百分比边界中较低者生效
+  hygiene_threshold: null                           # Gateway 继承完整有效策略；有效 (0,1) 值只覆盖百分比选择
   target_ratio: 0.20                                # 保留为最近尾部的阈值分数
   protect_last_n: 20                                # 保持未压缩的最少最近消息数
+  in_place: true                                    # 在同一 session ID 上压缩（默认）
   hygiene_hard_message_limit: 5000                  # Gateway 安全阀 —— 见下文
   context_timeout_seconds: 120                      # Agent 侧 compress_context 无进展超时（秒）—— 见下文
   context_total_ceiling_seconds: 600                # Agent 侧 compress_context 预提交等待上限（秒；已开始的 SessionDB 提交不会被放弃，超限会记录日志并告警）
@@ -614,6 +618,14 @@ auxiliary:
 :::info 旧版配置迁移
 带有 `compression.summary_model`、`compression.summary_provider` 和 `compression.summary_base_url` 的旧版配置在首次加载时自动迁移到 `auxiliary.compression.*`（配置版本 17）。无需手动操作。
 :::
+
+`progress_notices`（默认 `false`）控制聊天 gateway 是否显示常规压缩生命周期状态。设为 `true` 后可看到压缩开始、preflight/pre-API 触发、空闲压缩、重试和完成状态。失败通知和手动 `/compress` 反馈始终可见，不受该开关影响。
+
+`threshold: 0.50` 是原始全局默认值，不是对每个模型都固定在半窗口触发的承诺。Hermes 从配置值、内置路由/模型策略和最长匹配的用户 `model_thresholds` 中选择百分比，再组合小于 512K 窗口的只升不降 75% 下限、输出 token 预留、最小窗口保护与安全校正，以及可选正数 `threshold_tokens` 上限，得到有效 token 边界。
+
+`hygiene_threshold`（默认 `null`）只控制 Gateway agent 前清理的百分比选择。缺失或 `null` 会继承完整的 agent 有效策略。严格位于 `(0, 1)` 内的有限数值只替换全局/模型/路由/用户百分比选择阶段；小窗口下限、输出预留、保护、安全校正和 token 上限仍然应用。非数字或非有限值、布尔值、0、1、超范围值、列表和映射等无效值都安全回退到完整继承策略，且不会重写 `config.yaml`。Gateway 在每条入站消息时重新加载该值，因此 `null` → 显式值 → `null` 会在各自的下一条消息生效，无需重启。
+
+`in_place`（默认 `true`）使压缩保留同一 session ID。实时上下文会被压缩，被替换的旧轮次则在同一 ID 下软归档为 inactive/compacted，仍可搜索、可恢复，不会被删除。`in_place: false` 只为普通或手动的 agent 内压缩恢复旧式旋转，新 session 通过 `parent_session_id` 链接到旧 session。Gateway agent 前清理为了路由安全始终强制原地压缩，不受该偏好影响。
 
 `hygiene_hard_message_limit` 是仅限 gateway 的**预压缩安全阀**。它的存在是为了打破一个死循环：当超大会话的 API 调用持续断开时，gateway 永远收不到 token 使用数据，基于 token 的阈值因此无法触发，于是 transcript 持续增长、断开愈发严重。这个基于消息数的下限仅凭消息数量触发（无论 API 是否失败，消息数始终已知），强制压缩以恢复会话。默认 `5000` —— 远高于任何正常会话，包括做数千次短轮次的大上下文（1M+）模型，它们早就在 token 阈值处压缩了。对于异常平台可调得更高；要强制更积极的压缩则调低。在运行中的 gateway 上编辑此值将在下一条消息时生效（见下文）。
 
@@ -737,30 +749,9 @@ Hermes 对流式传输有单独的超时层，以及用于非流式调用的陈�
 
 **陈旧非流检测**终止长时间没有响应的非流式调用。默认情况下，Hermes 在本地端点上禁用此功能，以避免长时间预填充期间的误报。如果您显式设置 `providers.<id>.stale_timeout_seconds`、`providers.<id>.models.<model>.stale_timeout_seconds` 或 `HERMES_API_CALL_STALE_TIMEOUT`，即使在本地端点上也会遵守该显式值。
 
-## 上下文压力警告
+## 压缩进度通知
 
-与迭代预算压力分开，上下文压力跟踪对话距**压缩阈值**有多近 —— 即上下文压缩触发以摘要旧消息的点。这有助于您和 agent 了解对话何时变长。
-
-| 进度 | 级别 | 发生的事情 |
-|----------|-------|-------------|
-| **≥ 60%** 到阈值 | 信息 | CLI 显示青色进度条；gateway 发送信息通知 |
-| **≥ 85%** 到阈值 | 警告 | CLI 显示粗体黄色进度条；gateway 警告压缩即将发生 |
-
-在 CLI 中，上下文压力在工具输出流中显示为进度条：
-
-```
-  ◐ context ████████████░░░░░░░░ 62% to compaction  48k threshold (50%) · approaching compaction
-```
-
-在消息平台上，发送纯文本通知：
-
-```
-◐ Context: ████████████░░░░░░░░ 62% to compaction (threshold: 50% of window).
-```
-
-如果自动压缩被禁用，警告会告诉您上下文可能被截断。
-
-上下文压力是自动的 —— 无需配置。它纯粹作为面向用户的通知触发，不修改消息流或向模型上下文注入任何内容。
+Hermes 不实现固定的 60% 或 85% 上下文压力警告条。对话达到有效 token 边界时会开始压缩。默认 `compression.progress_notices: false` 使聊天 gateway 上的常规生命周期状态保持静默。设为 `true` 后会显示实际的压缩开始、preflight/pre-API 触发、空闲压缩、重试和完成状态。压缩失败和手动 `/compress` 反馈始终可见，即使常规通知被禁用也不例外。
 
 ## 凭据池策略
 

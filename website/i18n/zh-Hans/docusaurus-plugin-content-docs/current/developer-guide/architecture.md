@@ -217,7 +217,7 @@ CLI、gateway、cron、ACP 及辅助调用共用的运行时解析器。将 `(pr
 
 ### 会话持久化
 
-基于 SQLite 的会话存储，带 FTS5 全文检索。会话具有血缘追踪（跨压缩的父/子关系）、按平台隔离，以及带竞争处理的原子写入。
+基于 SQLite 的会话存储，带 FTS5 全文检索、按平台隔离，以及带竞争处理的原子写入。默认原地压缩保留同一 session ID，并在该 ID 下软归档被替换的行。`parent_session_id` schema 和血缘 helper 仍支持已存储血缘，以及 `compression.in_place: false` 启用的旧式普通/手动旋转路径；Gateway agent 前清理为路由安全始终使用原地压缩。
 
 → [会话存储](./session-storage.md)
 

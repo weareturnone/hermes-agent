@@ -27,7 +27,10 @@ Source file: `hermes_state.py`
 Key design decisions:
 - **WAL mode** for concurrent readers + one writer (gateway multi-platform)
 - **FTS5 virtual table** for fast text search across all session messages
-- **Session lineage** via `parent_session_id` chains (compression-triggered splits)
+- **Stable compaction identity by default**: replaced message rows are
+  soft-archived as inactive/compacted under the same session ID
+- **Session lineage** via `parent_session_id` chains for stored lineage and the
+  legacy `compression.in_place: false` normal/manual rotation path
 - **Source tagging** (`cli`, `telegram`, `discord`, etc.) for platform filtering
 - Batch runner and RL trajectories are NOT stored here (separate systems)
 
@@ -310,8 +313,15 @@ The `_sanitize_fts5_query()` method handles edge cases:
 
 ## Session Lineage
 
-Sessions can form chains via `parent_session_id`. This happens when context
-compression triggers a session split in the gateway.
+Sessions can form chains via `parent_session_id`, so the schema, indexes, SQL,
+query helpers, named-lineage resolution, and logical-lineage exports remain
+supported. New compression uses `compression.in_place: true` by default: the
+session ID stays stable, and replaced rows are marked inactive/compacted under
+that ID so they remain searchable and recoverable rather than being deleted.
+
+Set `compression.in_place: false` to use the legacy split into a linked child
+for normal or manual in-agent compaction. Gateway pre-agent hygiene always
+forces in-place compaction for routing safety and does not create a child.
 
 ### Query: Find Session Lineage
 

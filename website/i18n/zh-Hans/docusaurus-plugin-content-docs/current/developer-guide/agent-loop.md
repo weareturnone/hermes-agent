@@ -65,12 +65,12 @@ run_conversation()
   1. 若未提供则生成 task_id
   2. 将用户消息追加到对话历史
   3. 构建或复用已缓存的系统 prompt（prompt_builder.py）
-  4. 检查是否需要预检压缩（上下文超过 50%）
+  4. 检查 prompt token 是否已达到有效压缩边界
   5. 从对话历史构建 API 消息
      - chat_completions：直接使用 OpenAI 格式
      - codex_responses：转换为 Responses API 输入项
      - anthropic_messages：通过 anthropic_adapter.py 转换
-  6. 注入临时 prompt 层（预算警告、上下文压力提示）
+  6. 注入当前适用的临时 prompt 层
   7. 若使用 Anthropic，应用 prompt 缓存标记
   8. 发起可中断的 API 调用（_interruptible_api_call）
   9. 解析响应：
@@ -200,8 +200,8 @@ agent 通过 `IterationBudget` 追踪迭代次数：
 
 ### 压缩触发时机
 
-- **预检**（API 调用前）：对话超过模型上下文窗口的 50%
-- **Gateway 自动压缩**：对话超过 85%（更激进，在轮次之间运行）
+- **预检**（API 调用前）：当 prompt token 达到有效边界时触发。该边界由原始 `compression.threshold`（默认 `0.50`）、路由/模型与用户策略、小窗口下限、输出预留、保护与安全校正，以及可选正数 `threshold_tokens` 上限组合得出
+- **Gateway agent 前清理**（轮次之间）：默认继承上述完整有效策略。严格位于 `(0, 1)` 内的有效 `compression.hygiene_threshold` 只覆盖百分比选择；缺失或无效值继承原策略，更改会在每条入站消息时重新加载
 
 ### 压缩过程
 
@@ -209,7 +209,7 @@ agent 通过 `IterationBudget` 追踪迭代次数：
 2. 将中间对话轮次摘要为紧凑的摘要内容
 3. 保留最后 N 条消息完整不变（`compression.protect_last_n`，默认：20）
 4. 工具调用/结果消息对保持完整（不拆分）
-5. 生成新的 session 血缘 ID（压缩会创建一个"子" session）
+5. 默认 `compression.in_place: true` 会将被替换的轮次以 inactive/compacted 行软归档在同一 session ID 下，它们仍可搜索、可恢复。设为 `in_place: false` 只为普通/手动 agent 内压缩启用旧式子 session 旋转；Gateway 清理为路由安全始终强制原地压缩
 
 ### Session 持久化
 
