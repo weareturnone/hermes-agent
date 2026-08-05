@@ -34,6 +34,7 @@ MAX_DIMENSION = 8_000
 COMMENT_LOOKUP_ATTEMPTS = 6
 COMMENT_LOOKUP_DELAY_SECONDS = 2
 _SAFE_FILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.png$")
+_SAFE_DISPLAY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
 _ATTACHMENT_URL = re.compile(r"^!\[[^\]\r\n]*\]\((https://github\.com/user-attachments/assets/[0-9a-fA-F-]+)\)$")
 
 
@@ -43,6 +44,22 @@ class EvidenceFile:
 
     filename: str
     label: str
+
+
+def _evidence_label(prefix: str, name: str) -> str:
+    """Build one bounded reviewer-facing label from an untrusted name."""
+    if _SAFE_DISPLAY_NAME.fullmatch(name) is None:
+        raise ValueError(
+            "Unsafe evidence display name; start with an ASCII letter or digit "
+            "and use only ASCII letters, digits, spaces, dots, underscores, or hyphens"
+        )
+    label = f"{prefix}{name}"
+    if len(label) > 128:
+        raise ValueError(
+            "Evidence display label exceeds 128 characters; "
+            "shorten the evidence display name"
+        )
+    return label
 
 
 def _api_request(
@@ -103,18 +120,33 @@ def _manifest_files(manifest: dict[str, Any]) -> list[EvidenceFile]:
     for entry in screenshots:
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not isinstance(entry.get("file"), str):
             raise ValueError("Evidence screenshot entry is malformed")
-        files.append(EvidenceFile(entry["file"], f"new screenshot: {entry['name']}"))
+        files.append(
+            EvidenceFile(
+                entry["file"],
+                _evidence_label("new screenshot: ", entry["name"]),
+            )
+        )
 
     for entry in diffs:
         if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not isinstance(entry.get("diff"), str):
             raise ValueError("Evidence visual-diff entry is malformed")
-        files.append(EvidenceFile(entry["diff"], f"visual diff: {entry['name']}"))
+        files.append(
+            EvidenceFile(
+                entry["diff"],
+                _evidence_label("visual diff: ", entry["name"]),
+            )
+        )
         for kind in ("actual", "expected"):
             value = entry.get(kind)
             if value is not None:
                 if not isinstance(value, str):
                     raise ValueError("Evidence visual-diff companion is malformed")
-                files.append(EvidenceFile(value, f"visual {kind}: {entry['name']}"))
+                files.append(
+                    EvidenceFile(
+                        value,
+                        _evidence_label(f"visual {kind}: ", entry["name"]),
+                    )
+                )
 
     names = [item.filename for item in files]
     if len(files) > MAX_FILES or len(set(names)) != len(names):
@@ -160,9 +192,9 @@ def render_evidence(files: list[EvidenceFile], attachment_urls: dict[str, str]) 
             raise ValueError(f"Missing attachment URL for {item.filename}")
         blocks.extend((
             "<details>",
-            f"<summary>{item.label}</summary>",
+            f"<summary>{html.escape(item.label)}</summary>",
             "",
-            f"![{item.label}]({url})",
+            f"![E2E evidence]({url})",
             "",
             "</details>",
         ))
@@ -183,11 +215,25 @@ def render_upload_failure(error: Exception) -> str:
 
 def replace_evidence_marker(comment: str, evidence: str) -> str:
     """Replace exactly the pending-evidence region in a CI review comment."""
-    pattern = re.compile(f"{re.escape(EVIDENCE_START)}.*?{re.escape(EVIDENCE_END)}", re.DOTALL)
-    result, count = pattern.subn(evidence, comment, count=1)
-    if count != 1:
-        raise ValueError("CI review comment does not contain one evidence marker")
-    return result
+    start, end = _evidence_marker_bounds(comment)
+    return comment[:start] + evidence + comment[end:]
+
+
+def _evidence_marker_bounds(comment: str) -> tuple[int, int]:
+    """Return the bounds of one literal, correctly ordered marker pair."""
+    start = comment.find(EVIDENCE_START)
+    marker_end = comment.find(EVIDENCE_END)
+    if (
+        comment.count(EVIDENCE_START) != 1
+        or comment.count(EVIDENCE_END) != 1
+        or start > marker_end
+    ):
+        raise ValueError(
+            "CI review comment does not contain one valid region: expected exactly "
+            "one ordered evidence marker pair; restore the trusted evidence "
+            "placeholder before publishing"
+        )
+    return start, marker_end + len(EVIDENCE_END)
 
 
 def _find_review_comment(comments: object) -> dict[str, Any] | None:
@@ -280,13 +326,15 @@ def publish(
         print("No inline E2E evidence to publish.")
         return False
     comment = _wait_for_review_comment(token, source_repo, pr_number)
+    comment_body = str(comment.get("body", ""))
+    _evidence_marker_bounds(comment_body)
     try:
         attachment_urls = upload_evidence(
             files, evidence_dir, source_repo, session_token
         )
     except Exception as exc:
         body = replace_evidence_marker(
-            str(comment.get("body", "")), render_upload_failure(exc)
+            comment_body, render_upload_failure(exc)
         )
         _api_request(
             f"{API_BASE}/repos/{source_repo}/issues/comments/{comment['id']}",
@@ -296,7 +344,7 @@ def publish(
         )
         raise
     evidence = render_evidence(files, attachment_urls)
-    body = replace_evidence_marker(str(comment.get("body", "")), evidence)
+    body = replace_evidence_marker(comment_body, evidence)
     _api_request(
         f"{API_BASE}/repos/{source_repo}/issues/comments/{comment['id']}",
         token,
