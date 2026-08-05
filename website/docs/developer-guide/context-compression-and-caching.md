@@ -1,7 +1,7 @@
 # Context Compression and Caching
 
-Hermes Agent uses a dual compression system and Anthropic prompt caching to
-manage context window usage efficiently across long conversations.
+Hermes Agent uses two coordinated compression checkpoints and Anthropic prompt
+caching to manage context window usage efficiently across long conversations.
 
 Source files: `agent/context_engine.py` (ABC), `agent/context_compressor.py` (default engine),
 `agent/prompt_caching.py`, `gateway/run.py` (session hygiene), `run_agent.py` (search for `_compress_context`)
@@ -34,40 +34,40 @@ Configure via `hermes plugins` → Provider Plugins → Context Engine, or edit 
 
 For building a context engine plugin, see [Context Engine Plugins](/developer-guide/context-engine-plugin).
 
-## Dual Compression System
+## Coordinated Compression Checkpoints
 
-Hermes has two separate compression layers that operate independently:
+The gateway and agent checkpoints use the same effective compression boundary
+by default:
 
 ```
                      ┌──────────────────────────┐
-  Incoming message   │   Gateway Session Hygiene │  Fires at 85% of context
-  ─────────────────► │   (pre-agent, rough est.) │  Safety net for large sessions
+  Incoming message   │ Gateway Session Hygiene  │  Effective agent policy
+  ─────────────────► │ (pre-agent checkpoint)   │  Actual or estimated tokens
                      └─────────────┬────────────┘
                                    │
                                    ▼
                      ┌──────────────────────────┐
-                     │   Agent ContextCompressor │  Fires at 50% of context (default)
-                     │   (in-loop, real tokens)  │  Normal context management
+                     │ Agent ContextCompressor  │  Same boundary resolution
+                     │ (in-loop checkpoint)     │  API-reported tokens
                      └──────────────────────────┘
 ```
 
-### 1. Gateway Session Hygiene (85% threshold)
+### 1. Gateway Session Hygiene (pre-agent)
 
 Located in `gateway/run.py` (search for `Session hygiene: auto-compress`). This is a **safety net** that
 runs before the agent processes a message. It prevents API failures when sessions
 grow too large between turns (e.g., overnight accumulation in Telegram/Discord).
 
-- **Threshold**: Fixed at 85% of model context length
+- **Threshold**: Inherits the complete effective agent compression policy when
+  `compression.hygiene_threshold` is omitted or `null`; a valid explicit value
+  overrides only the policy's percentage-selection stages
 - **Token source**: Prefers actual API-reported tokens from last turn; falls back
   to rough character-based estimate (`estimate_messages_tokens_rough`)
 - **Fires**: Only when `len(history) >= 4` and compression is enabled
-- **Purpose**: Catch sessions that escaped the agent's own compressor
+- **Purpose**: Apply the effective boundary before agent startup, including to
+  sessions that escaped in-loop compression
 
-The gateway hygiene threshold is intentionally higher than the agent's compressor.
-Setting it at 50% (same as the agent) caused premature compression on every turn
-in long gateway sessions.
-
-### 2. Agent ContextCompressor (50% threshold, configurable)
+### 2. Agent ContextCompressor (in-loop)
 
 Located in `agent/context_compressor.py`. This is the **primary compression
 system** that runs inside the agent's tool loop with access to accurate,
@@ -81,12 +81,21 @@ All compression settings are read from `config.yaml` under the `compression` key
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
-  threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
+  progress_notices: false    # Opt in to routine gateway compression statuses
+  threshold: 0.50            # Raw global percentage before policy composition
+  threshold_tokens: null     # Optional absolute token cap on the effective boundary
+  hygiene_threshold: null    # Gateway inherits the complete agent policy (default)
+  # hygiene_threshold: "0.80"  # Explicit gateway percentage override; numeric strings work
+  # model_thresholds:        # Per-model threshold overrides (substring match,
+  #   "glm-5.2": 0.40        # longest key wins). See "Per-model threshold
+  #   "claude-sonnet": 0.35  # overrides" below.
   target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
   protect_last_n: 20         # Minimum protected tail messages (default: 20)
+  min_tail_user_messages: 1  # Real user messages guaranteed in the tail (default: 1)
   codex_gpt55_autoraise: true  # gpt-5.5 on Codex OAuth: raise trigger to 85% (default: true)
   codex_gpt55_autoraise_notice: true  # Show the one-time autoraise notice (default: true)
   codex_app_server_auto: native  # native|hermes|off for Codex app-server thread compaction
+  in_place: true             # Compact on the same session id, no rotation (default: true)
 
 # Summarization model/provider configured under auxiliary:
 auxiliary:
@@ -100,13 +109,102 @@ auxiliary:
 
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
-| `threshold` | `0.50` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × context_length` |
+| `progress_notices` | `false` | bool | Show routine compression start, preflight/pre-API, idle, retry, and completion statuses on chat gateways. Failure notices and manual `/compress` feedback stay visible either way |
+| `threshold` | `0.50` | 0.0-1.0 | Raw global percentage used as the starting point for the effective boundary |
+| `threshold_tokens` | `null` | positive integer or `null` | Optional absolute token cap; the lower of this cap and the resolved percentage boundary wins |
+| `hygiene_threshold` | `null` | finite value strictly inside `(0, 1)`, or `null` | Gateway-only percentage override. `null` or an invalid value inherits the complete effective agent policy |
+| `model_thresholds` | `{}` | map | Per-model overrides of `threshold`. Keys are substring-matched against the model name (longest match wins). The small-context floor still applies on top (see below) |
 | `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` |
 | `protect_last_n` | `20` | ≥1 | Minimum number of recent messages always preserved |
+| `min_tail_user_messages` | `1` | ≥1 | Minimum number of REAL (actionable) user messages guaranteed to survive in the uncompressed tail. `1` = the existing single last-user anchor (behavior-preserving default). Raise to e.g. `3` to keep the last 3 real user turns verbatim even when bulky tool outputs fill the tail token budget. Blank platform echoes, compaction handoffs, and synthetic continuation rows never count toward N. The guarantee wins over the tail token budget — the tail may exceed the budget when the anchor pulls the cut back |
 | `protect_first_n` | `3` | (hardcoded) | System prompt + first exchange always preserved |
+| `idle_compact_after_seconds` | `0` | ≥0 seconds | Opt-in: compact up front when a session resumes after this many seconds idle (0 = disabled). Skips when context ≤ threshold × target_ratio; honors cooldown/anti-thrash/lock guards |
 | `codex_gpt55_autoraise` | `true` | bool | Raise the trigger to 85% for gpt-5.5 on the ChatGPT Codex OAuth route (see below). Set `false` to keep the global `threshold` |
 | `codex_gpt55_autoraise_notice` | `true` | bool | Show the one-time Codex gpt-5.5 autoraise notice. Set `false` to keep the 85% autoraise but suppress the banner |
 | `codex_app_server_auto` | `native` | `native`, `hermes`, `off` | Thread-compaction mode for Codex app-server sessions (see below) |
+| `in_place` | `true` | bool | Compact on the same session id instead of rotating to a new one (see below) |
+
+### Gateway hygiene policy and overrides
+
+With `compression.hygiene_threshold` omitted or set to `null`, gateway hygiene
+inherits the complete effective agent policy. The percentage-selection stages
+start with the global `threshold`, apply built-in route/model rules (including
+the Codex OAuth autoraise where applicable), and then apply the longest matching
+user `model_thresholds` entry. Boundary calculation then composes that selected
+percentage with all of the following:
+
+1. The raise-only small-window floor for context windows below 512K.
+2. Output-token reservation, which reduces the effective input window when a
+   positive `max_tokens` value is configured.
+3. The 64K minimum-window guard.
+4. The below-window safety correction: if the guarded boundary reaches or
+   exceeds the effective window, it is corrected to 85% of that window (and
+   kept strictly below the window).
+5. The optional absolute `threshold_tokens` cap, applied last.
+
+A valid explicit `hygiene_threshold` replaces the inherited percentage-selection
+stages (global threshold, built-in model/route selection, and user model match),
+but it still composes with the small-window floor, output reservation,
+minimum-window guard and safety correction, and absolute token cap.
+
+YAML numeric scalars and quoted numeric strings are accepted because the current
+loader uses `float()` coercion. The result must be finite and strictly inside
+`(0, 1)`. Non-numeric strings, `NaN`/infinity, `0` and `1`, out-of-range values,
+booleans, lists, and mappings safely fall back to the complete inherited policy;
+the fallback does not rewrite `config.yaml`.
+
+Gateway configuration is reloaded for each inbound message when the config file
+changes. A valid explicit value therefore takes effect on the next inbound
+message without a gateway restart, and changing it back to `null` restores the
+complete inherited policy on the next inbound message.
+
+### In-place compaction (single stable session id)
+
+With `compression.in_place: true` (the default), a compaction **rewrites the live message list on the same session id**: the system prompt is rebuilt, the summarized middle is swapped in, and the pre-compaction turns are soft-archived under the same id (`active=0, compacted=1` in the session store) — still searchable via `session_search` and recoverable, never deleted. There is no `parent_session_id` chain and no `name #N` renumbering; one conversation keeps one durable id for its whole life. This eliminated the session-rotation bug cluster (lost `/goal` state, orphaned sessions, search gaps across boundaries).
+
+Consumers observe the mode rather than diffing session ids:
+
+- The `session:compress` event carries `in_place: true/false` and `old_session_id` (empty string in in-place mode, since there is no old id).
+- The gateway re-baselines transcript handling from the agent's rotation-independent `_last_compaction_in_place` flag, not from an id-change diff.
+
+Set `in_place: false` to restore the legacy rotating path for normal or manual
+in-agent compaction, where each compaction commits a new session id linked to
+the previous one via `parent_session_id`. Gateway pre-agent hygiene is the
+exception: it always forces in-place compaction for routing safety and never
+publishes a continuation child, regardless of this preference.
+
+### Per-model threshold overrides
+
+`compression.model_thresholds` lets you trigger compaction at different points
+depending on the active model — useful when you swap between models with very
+different context windows (e.g. a 1M-context model can compress later while a
+128K model should compress earlier):
+
+```yaml
+compression:
+  threshold: 0.50
+  model_thresholds:
+    "glm-5.2": 0.40
+    "glm-5.2-1M": 0.25
+    "claude-sonnet": 0.35
+```
+
+Resolution rules:
+
+- Keys are **substring-matched** against the model name; the **longest
+  matching key wins** (`glm-5.2-1M` beats `glm-5.2` for model `glm-5.2-1M`).
+- When no key matches (or the map is empty), the global `threshold` applies.
+- The override is re-resolved on every `/model` switch; switching to a model
+  with no matching key falls back to the global `threshold`.
+- The **small-context floor still applies on top** of overrides (raise-only):
+  models with context windows below 512K are floored at `0.75`, so an
+  override below the floor is raised to `0.75`, while an override above it
+  (e.g. `0.80`) wins.
+
+Plugin context engines can reuse the same resolution logic via
+`from agent.context_compressor import resolve_model_threshold`; engines that
+override `update_model()` own their own compaction policy and may ignore the
+map.
 
 ### Codex gpt-5.5 threshold autoraise
 
@@ -159,19 +257,18 @@ routes (including Codex OAuth chat sessions) keep Hermes' summary compressor.
 
 ```
 context_length       = 200,000
-threshold_tokens     = 200,000 × 0.50 = 100,000
-tail_token_budget    = 100,000 × 0.20 = 20,000
+selected_percentage  = max(0.50, 0.75 small-window floor) = 0.75
+effective_boundary   = 200,000 × 0.75 = 150,000
+tail_token_budget    = 150,000 × 0.20 = 30,000
 max_summary_tokens   = min(200,000 × 0.05, 12,000) = 10,000
 ```
 
 :::note Threshold is derived from the MAIN model's context window
-`threshold_tokens` is always `threshold × context_length`, where `context_length`
-is the **main agent model's** context window — never the auxiliary/summary
-model's. On a 262,144-token model at the default `0.50`, the threshold is
-`262,144 × 0.50 = 131,072`. That number being close to a common "128K context"
-is a coincidence of the percentage, not a sign that the auxiliary model's window
-is the trigger. The auxiliary model's context window is a separate concern — see
-the "Summary model context length" warning below for how it affects whether a
+The percentage boundary is derived from the **main agent model's** context
+window — never the auxiliary/summary model's — and then composed with output
+reservation, the minimum-window guard and safety correction, and any absolute
+token cap. The auxiliary model's context window is a separate concern; see the
+"Summary model context length" warning below for how it affects whether a
 summary can be produced, not when compression fires.
 :::
 
@@ -419,4 +516,16 @@ The CLI shows caching status at startup:
 
 ## Context Pressure Warnings
 
-Intermediate context-pressure warnings have been removed (see the iteration-budget block in `run_agent.py`, which notes: "No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"). Compression fires when prompt tokens reach the configured `compression.threshold` (default 50%) with no prior warning step; gateway session hygiene fires as the secondary safety net at 85% of the model's context window.
+Intermediate fixed-percentage context-pressure warnings have been removed (see
+the iteration-budget block in `run_agent.py`, which notes: "No intermediate
+pressure warnings — they caused models to 'give up' prematurely on complex
+tasks"). Compression fires when prompt tokens reach the effective compression
+boundary with no 60% or 85% warning-bar step. Gateway session hygiene applies
+that same effective policy by default as a pre-agent safety checkpoint, or uses
+a valid explicit `compression.hygiene_threshold` override as described above.
+
+On chat gateways, `compression.progress_notices: false` keeps routine
+compression progress silent by default. Set it to `true` to show the actual
+start, preflight/pre-API, idle, retry, and completion lifecycle statuses.
+Compression failures and manual `/compress` feedback remain visible regardless
+of this setting.

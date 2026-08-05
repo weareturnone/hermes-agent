@@ -83,11 +83,11 @@ delegation:
 
 ## 终端后端配置
 
-Hermes 支持六种终端后端。每种后端决定 agent 的 shell 命令实际在哪里执行 —— 本地机器、Docker 容器、通过 SSH 的远程服务器、Modal 云沙箱（直接或通过 Nous 托管的 gateway）、Daytona 工作区，或 Singularity/Apptainer 容器。
+Hermes 支持七种终端后端。每种后端决定 agent 的 shell 命令实际在哪里执行 —— 本地机器、Docker 容器、通过 SSH 的远程服务器、Modal 云沙箱（直接或通过 Nous 托管的 gateway）、Daytona 工作区、Vercel Sandbox，或 Singularity/Apptainer 容器。
 
 ```yaml
 terminal:
-  backend: local    # local | docker | ssh | modal | daytona | singularity
+  backend: local    # local | docker | ssh | modal | daytona | vercel_sandbox | singularity
   cwd: "."          # Gateway/cron 工作目录（CLI 始终使用启动目录）
   timeout: 180      # 每条命令的超时时间（秒）
   env_passthrough: []  # 转发到沙箱执行的环境变量名（terminal + execute_code）
@@ -96,7 +96,7 @@ terminal:
   daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"               # Daytona 后端的容器镜像
 ```
 
-对于 Modal 和 Daytona 等云沙箱，`container_persistent: true` 表示 Hermes 将尝试在沙箱重建后保留文件系统状态。这并不保证相同的活跃沙箱、PID 空间或后台进程之后仍在运行。
+对于 Modal、Daytona 和 Vercel Sandbox 等云沙箱，`container_persistent: true` 表示 Hermes 将尝试在沙箱重建后保留文件系统状态。这并不保证相同的活跃沙箱、PID 空间或后台进程之后仍在运行。
 
 ### 后端概览
 
@@ -107,6 +107,7 @@ terminal:
 | **ssh** | 通过 SSH 的远程服务器 | 网络边界 | 远程开发、强大硬件 |
 | **modal** | Modal 云沙箱 | 完全（云 VM） | 临时云计算、评估 |
 | **daytona** | Daytona 工作区 | 完全（云容器） | 托管云开发环境 |
+| **vercel_sandbox** | Vercel Sandbox | 完全（云 microVM） | 带快照文件系统持久化的云执行 |
 | **singularity** | Singularity/Apptainer 容器 | 命名空间（--containall） | HPC 集群、共享机器 |
 
 ### Local 后端
@@ -230,6 +231,49 @@ terminal:
 **持久化：** 启用后，沙箱在清理时停止（而非删除），并在下次会话时恢复。沙箱名称遵循 `hermes-{task_id}` 模式。
 
 **磁盘限制：** Daytona 强制执行 10 GiB 最大值。超过此值的请求将被截断并发出警告。
+
+### Vercel Sandbox 后端
+
+在 [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) 云 microVM 中运行命令。Hermes 使用普通的终端和文件工具接口；没有 Vercel 特定的面向模型的工具。
+
+```yaml
+terminal:
+  backend: vercel_sandbox
+  vercel_runtime: node24          # node24 | node22 | python3.13
+  cwd: /vercel/sandbox            # 默认工作区根目录
+  container_persistent: true      # 快照/恢复文件系统
+  container_disk: 51200           # 仅共享默认值；不支持自定义磁盘
+```
+
+**必需安装：** 安装可选 SDK 扩展：
+
+```bash
+pip install 'hermes-agent[vercel]'
+```
+
+**必需认证：** 使用 `VERCEL_TOKEN`、`VERCEL_PROJECT_ID` 和 `VERCEL_TEAM_ID` 三者全部配置访问令牌认证。这是在 Render、Railway、Docker 及类似宿主上部署和正常长期运行 Hermes 进程的受支持设置。
+
+对于一次性本地开发，Hermes 也接受短期 Vercel OIDC token：
+
+```bash
+VERCEL_OIDC_TOKEN="$(vc project token <project-name>)" hermes chat
+```
+
+在已链接的 Vercel 项目目录中，可以省略项目名称：
+
+```bash
+VERCEL_OIDC_TOKEN="$(vc project token)" hermes chat
+```
+
+OIDC token 是短期的，不应作为文档化的部署路径使用。
+
+**运行时：** `terminal.vercel_runtime` 支持 `node24`、`node22` 和 `python3.13`。未设置时，Hermes 默认使用 `node24`。
+
+**持久化：** 当 `container_persistent: true` 时，Hermes 在清理期间对沙箱文件系统进行快照，并从该快照为同一任务恢复后续沙箱。快照内容可以包括复制到沙箱中的 Hermes 同步凭据、技能和缓存文件。这仅保留文件系统状态；不保留活跃沙箱身份、PID 空间、shell 状态或正在运行的后台进程。
+
+**后台命令：** `terminal(background=true)` 使用 Hermes 的通用非本地后台进程流程。您可以在沙箱存活期间通过普通进程工具生成、轮询、等待、查看日志和终止进程。Hermes 不提供清理或重启后的原生 Vercel 分离进程恢复。
+
+**磁盘大小：** Vercel Sandbox 目前不支持 Hermes 的 `container_disk` 资源旋钮。将 `container_disk` 保持未设置或使用共享默认值 `51200`；非默认值会导致诊断和后端创建失败，而不是被静默忽略。
 
 ### Singularity/Apptainer 后端
 
@@ -552,10 +596,16 @@ Hermes 自动压缩长对话以保持在模型的上下文窗口内。压缩摘�
 ```yaml
 compression:
   enabled: true                                     # 开启/关闭压缩
-  threshold: 0.50                                   # 在上下文限制的此百分比时压缩
+  progress_notices: false                           # 选择显示常规 gateway 压缩进度通知
+  threshold: 0.50                                   # 组合有效策略前的原始全局百分比
+  threshold_tokens: null                            # 可选绝对 token 上限；与百分比边界中较低者生效
+  hygiene_threshold: null                           # Gateway 继承完整有效策略；有效 (0,1) 值只覆盖百分比选择
   target_ratio: 0.20                                # 保留为最近尾部的阈值分数
   protect_last_n: 20                                # 保持未压缩的最少最近消息数
+  in_place: true                                    # 在同一 session ID 上压缩（默认）
   hygiene_hard_message_limit: 5000                  # Gateway 安全阀 —— 见下文
+  context_timeout_seconds: 120                      # Agent 侧 compress_context 无进展超时（秒）—— 见下文
+  context_total_ceiling_seconds: 600                # Agent 侧 compress_context 预提交等待上限（秒；已开始的 SessionDB 提交不会被放弃，超限会记录日志并告警）
 
 # 摘要模型/provider 在 auxiliary: 下配置：
 auxiliary:
@@ -569,7 +619,19 @@ auxiliary:
 带有 `compression.summary_model`、`compression.summary_provider` 和 `compression.summary_base_url` 的旧版配置在首次加载时自动迁移到 `auxiliary.compression.*`（配置版本 17）。无需手动操作。
 :::
 
+`progress_notices`（默认 `false`）控制聊天 gateway 是否显示常规压缩生命周期状态。设为 `true` 后可看到压缩开始、preflight/pre-API 触发、空闲压缩、重试和完成状态。失败通知和手动 `/compress` 反馈始终可见，不受该开关影响。
+
+`threshold: 0.50` 是原始全局默认值，不是对每个模型都固定在半窗口触发的承诺。Hermes 从配置值、内置路由/模型策略和最长匹配的用户 `model_thresholds` 中选择百分比，再组合小于 512K 窗口的只升不降 75% 下限、输出 token 预留、最小窗口保护与安全校正，以及可选正数 `threshold_tokens` 上限，得到有效 token 边界。
+
+`hygiene_threshold`（默认 `null`）只控制 Gateway agent 前清理的百分比选择。缺失或 `null` 会继承完整的 agent 有效策略。严格位于 `(0, 1)` 内的有限数值只替换全局/模型/路由/用户百分比选择阶段；小窗口下限、输出预留、保护、安全校正和 token 上限仍然应用。非数字或非有限值、布尔值、0、1、超范围值、列表和映射等无效值都安全回退到完整继承策略，且不会重写 `config.yaml`。Gateway 在每条入站消息时重新加载该值，因此 `null` → 显式值 → `null` 会在各自的下一条消息生效，无需重启。
+
+`in_place`（默认 `true`）使压缩保留同一 session ID。实时上下文会被压缩，被替换的旧轮次则在同一 ID 下软归档为 inactive/compacted，仍可搜索、可恢复，不会被删除。`in_place: false` 只为普通或手动的 agent 内压缩恢复旧式旋转，新 session 通过 `parent_session_id` 链接到旧 session。Gateway agent 前清理为了路由安全始终强制原地压缩，不受该偏好影响。
+
 `hygiene_hard_message_limit` 是仅限 gateway 的**预压缩安全阀**。它的存在是为了打破一个死循环：当超大会话的 API 调用持续断开时，gateway 永远收不到 token 使用数据，基于 token 的阈值因此无法触发，于是 transcript 持续增长、断开愈发严重。这个基于消息数的下限仅凭消息数量触发（无论 API 是否失败，消息数始终已知），强制压缩以恢复会话。默认 `5000` —— 远高于任何正常会话，包括做数千次短轮次的大上下文（1M+）模型，它们早就在 token 阈值处压缩了。对于异常平台可调得更高；要强制更积极的压缩则调低。在运行中的 gateway 上编辑此值将在下一条消息时生效（见下文）。
+
+`context_timeout_seconds`（默认 `120`）是 agent 侧 `compress_context`（对话循环、预检压缩、手动 `/compress`）的**无进展超时**，语义与 gateway 会话预压缩（session hygiene）的 inactivity 预算相同：摘要模型仍在流式出 token 时会延长等待；仅当完全无输出时才跳过压缩并保留原消息。设为 `0` 可关闭。Gateway 会话预压缩仍使用自己的 `hygiene_timeout_seconds`，不会被双重包装。
+
+`context_total_ceiling_seconds`（默认 `600`）限制即使仍有 token 推进时的 agent 侧**预提交**等待时间（摘要 / 流式阶段），并会被钳制为至少等于 `context_timeout_seconds`。确切保证：**摘要阶段受该上限约束；提交阶段若超出上限则记录日志并向用户告警。**一旦 worker 已进入 compression commit fence 且 SessionDB 变更正在进行，提交绝不会被中途放弃（那会导致 transcript 分叉），但等待不再是静默的：若提交超过上限，Hermes 会记录超时（WARNING，重复时升级为 ERROR），通过用户可见的警告通道发送一次性提醒，并以有界增量继续等待直到提交完成。
 
 :::tip Gateway 热重载压缩和上下文长度
 从最近的版本开始，在运行中的 gateway 上编辑 `config.yaml` 中的 `model.context_length` 或任何 `compression.*` 键将在下一条消息时生效 —— 无需 gateway 重启、`/reset` 或会话轮换。缓存的 agent 签名包含这些键，因此 gateway 在检测到更改时会透明地重建 agent。API 密钥和工具/技能配置仍需要通常的重载路径。
@@ -615,6 +677,25 @@ auxiliary:
 摘要模型**必须**具有至少与您的主 agent 模型一样大的上下文窗口。压缩器将对话的完整中间部分发送给摘要模型 —— 如果该模型的上下文窗口小于主模型的，摘要调用将因上下文长度错误而失败。发生这种情况时，中间轮次将**在没有摘要的情况下被丢弃**，静默丢失对话上下文。如果您覆盖模型，请验证其上下文长度满足或超过您的主模型。
 :::
 
+## 会话卡死监视器（Session Stall Watchdog）
+
+Gateway 运行一个仅通知的卡死监视器（`agent.session_stall_timeout`，默认 `300` 秒，`0` = 禁用）。当一个忙碌的会话存在**待处理的入站后续消息**，且 agent 的共享活动时钟空闲达到该时长时，gateway 会记录一条 WARNING 日志并向用户发送一次性通知：
+
+```
+⚠️ Agent session appears stalled (last activity N min ago). Try /new to reset.
+```
+
+语义：
+
+- **仅通知。** 监视器绝不会终止当前轮次 —— 对比 `agent.gateway_timeout`（长时间无活动后取消运行）。卡死通知只是告诉您 agent 看起来卡住了，由您决定（`/new`、`/stop` 或继续等待）。
+- **每个卡死周期只通知一次。** 待处理入站消息被消化或活动恢复时闩锁清除，因此恢复后再次卡死的会话会再次通知。
+- 进度仅来自共享活动快照（工具调用、API 流式进度、压缩心跳）。待处理入站消息是通知门槛，不是进度时钟。
+
+```yaml
+agent:
+  session_stall_timeout: 300   # 秒；0 禁用监视器
+```
+
 ## 上下文引擎
 
 上下文引擎控制在接近模型 token 限制时如何管理对话。内置的 `compressor` 引擎使用有损摘要（参见[上下文压缩](/developer-guide/context-compression-and-caching)）。插件引擎可以用替代策略替换它。
@@ -637,17 +718,17 @@ context:
 
 ## 迭代预算
 
-当 agent 在处理具有许多工具调用的复杂任务时，它可能会耗尽其迭代预算（默认：90 轮）。Hermes **不会**在任务中途注入压力警告 —— 早期版本会在预算达到 70%/90% 时警告模型，这会导致模型过早放弃复杂任务，该机制已于 2026 年 4 月移除。
+当 agent 在处理具有许多工具调用的复杂任务时，它可能会耗尽其迭代预算（默认：500 轮）。Hermes **不会**在任务中途注入压力警告 —— 早期版本会在预算达到 70%/90% 时警告模型，这会导致模型过早放弃复杂任务，该机制已于 2026 年 4 月移除。
 
-取而代之的是，当预算真正耗尽（90/90）时，Hermes 注入一条消息要求模型收尾，并允许一次**宽限调用**以便其给出最终响应。如果该宽限调用仍未产生文本，则会要求 agent 总结已完成的工作。
+取而代之的是，当预算真正耗尽（500/500）时，Hermes 注入一条消息要求模型收尾，并允许一次**宽限调用**以便其给出最终响应。如果该宽限调用仍未产生文本，则会要求 agent 总结已完成的工作。
 
 ```yaml
 agent:
-  max_turns: 90                # 每次对话轮次的最大迭代次数（默认：90）
+  max_turns: 500               # 每次对话轮次的最大迭代次数（默认：500）
   api_max_retries: 3           # 回退启动前每个 provider 的重试次数（默认：3）
 ```
 
-当迭代预算完全耗尽时，CLI 向用户显示通知：`⚠ Iteration budget reached (90/90) — response may be incomplete`。
+当迭代预算完全耗尽时，CLI 向用户显示通知：`⚠ Iteration budget reached (500/500) — response may be incomplete`。
 
 `agent.api_max_retries` 控制 Hermes 在回退 provider 切换启动**之前**对瞬时错误（速率限制、连接断开、5xx）重试 provider API 调用的次数。默认为 `3` —— 总共四次尝试。如果您配置了[回退 providers](/user-guide/features/fallback-providers) 并希望更快地故障转移，请将其降至 `0`，这样主 provider 上的第一个瞬时错误会立即切换到回退，而不是对不稳定的端点进行重试。
 
@@ -668,30 +749,9 @@ Hermes 对流式传输有单独的超时层，以及用于非流式调用的陈�
 
 **陈旧非流检测**终止长时间没有响应的非流式调用。默认情况下，Hermes 在本地端点上禁用此功能，以避免长时间预填充期间的误报。如果您显式设置 `providers.<id>.stale_timeout_seconds`、`providers.<id>.models.<model>.stale_timeout_seconds` 或 `HERMES_API_CALL_STALE_TIMEOUT`，即使在本地端点上也会遵守该显式值。
 
-## 上下文压力警告
+## 压缩进度通知
 
-与迭代预算压力分开，上下文压力跟踪对话距**压缩阈值**有多近 —— 即上下文压缩触发以摘要旧消息的点。这有助于您和 agent 了解对话何时变长。
-
-| 进度 | 级别 | 发生的事情 |
-|----------|-------|-------------|
-| **≥ 60%** 到阈值 | 信息 | CLI 显示青色进度条；gateway 发送信息通知 |
-| **≥ 85%** 到阈值 | 警告 | CLI 显示粗体黄色进度条；gateway 警告压缩即将发生 |
-
-在 CLI 中，上下文压力在工具输出流中显示为进度条：
-
-```
-  ◐ context ████████████░░░░░░░░ 62% to compaction  48k threshold (50%) · approaching compaction
-```
-
-在消息平台上，发送纯文本通知：
-
-```
-◐ Context: ████████████░░░░░░░░ 62% to compaction (threshold: 50% of window).
-```
-
-如果自动压缩被禁用，警告会告诉您上下文可能被截断。
-
-上下文压力是自动的 —— 无需配置。它纯粹作为面向用户的通知触发，不修改消息流或向模型上下文注入任何内容。
+Hermes 不实现固定的 60% 或 85% 上下文压力警告条。对话达到有效 token 边界时会开始压缩。默认 `compression.progress_notices: false` 使聊天 gateway 上的常规生命周期状态保持静默。设为 `true` 后会显示实际的压缩开始、preflight/pre-API 触发、空闲压缩、重试和完成状态。压缩失败和手动 `/compress` 反馈始终可见，即使常规通知被禁用也不例外。
 
 ## 凭据池策略
 
@@ -767,7 +827,7 @@ Hermes 中的每个模型槽位 —— 辅助任务、压缩、回退 —— 使
 
 当设置 `base_url` 时，Hermes 忽略 provider 并直接调用该端点（使用 `api_key` 或 `OPENAI_API_KEY` 进行认证）。当仅设置 `provider` 时，Hermes 使用该 provider 的内置认证和基础 URL。
 
-辅助任务的可用 providers：`auto`、`main`，以及[provider 注册表](/reference/environment-variables)中的任何 provider —— `openrouter`、`nous`、`openai-codex`、`copilot`、`copilot-acp`、`anthropic`、`gemini`、`qwen-oauth`、`zai`、`kimi-coding`、`kimi-coding-cn`、`minimax`、`minimax-cn`、`minimax-oauth`、`deepseek`、`nvidia`、`xai`、`xai-oauth`、`ollama-cloud`、`alibaba`、`bedrock`、`huggingface`、`arcee`、`xiaomi`、`kilocode`、`opencode-zen`、`opencode-go`、`azure-foundry` —— 或您 `custom_providers` 列表中任何命名的自定义 provider（例如 `provider: "beans"`）。
+辅助任务的可用 providers：`auto`、`main`，以及[provider 注册表](/reference/environment-variables)中的任何 provider —— `openrouter`、`nous`、`openai-codex`、`copilot`、`copilot-acp`、`anthropic`、`gemini`、`qwen-oauth`、`zai`、`kimi-coding`、`kimi-coding-cn`、`minimax`、`minimax-cn`、`minimax-oauth`、`deepseek`、`nvidia`、`xai`、`xai-oauth`、`ollama-cloud`、`alibaba`、`bedrock`、`huggingface`、`arcee`、`xiaomi`、`kilocode`、`opencode-zen`、`opencode-go`、`ai-gateway`、`azure-foundry` —— 或您 `custom_providers` 列表中任何命名的自定义 provider（例如 `provider: "beans"`）。
 
 :::tip MiniMax OAuth
 `minimax-oauth` 通过浏览器 OAuth 登录（无需 API 密钥）。运行 `hermes model` 并选择 **MiniMax (OAuth)** 进行认证。辅助任务自动使用 `MiniMax-M2.7-highspeed`。参阅 [MiniMax OAuth 指南](../guides/minimax-oauth.md)。
@@ -1146,7 +1206,6 @@ display:
   tool_progress: all      # off | new | all | verbose
   tool_progress_command: false  # 在消息 gateway 中启用 /verbose 斜杠命令
   platforms: {}           # 每平台显示覆盖（见下文）
-  tool_progress_overrides: {}  # 已弃用 —— 改用 display.platforms
   interim_assistant_messages: true  # Gateway：将自然的轮次中 assistant 更新作为单独消息发送
   skin: default           # 内置或自定义 CLI 皮肤（参阅 user-guide/features/skins）
   personality: "kawaii"  # 旧版外观字段，仍在某些摘要中显示
@@ -1272,13 +1331,13 @@ stt:
   local:
     model: "base"              # tiny、base、small、medium、large-v3
   openai:
-    model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe
+    model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe | gpt-transcribe
   # model: "whisper-1"         # 旧版回退键仍受支持
 ```
 
 Provider 行为：
 
-- `local` 使用在您机器上运行的 `faster-whisper`。使用 `pip install faster-whisper` 单独安装。
+- `local` 使用在您机器上运行的 `faster-whisper`。使用 `pip install faster-whisper` 单独安装。静音幻觉防护默认开启:Silero VAD 过滤器让静音/噪声不会进入 Whisper,跨窗口条件预测被禁用,并且模型自己标记为"很可能不是语音"且低置信度的片段会被丢弃。设置 `stt.local.vad: false` 可用原始行为转录非语音音频(音乐、环境声)。
 - `groq` 使用 Groq 的 Whisper 兼容端点，读取 `GROQ_API_KEY`。
 - `openai` 使用 OpenAI 语音 API，读取 `VOICE_TOOLS_OPENAI_KEY`。
 
@@ -1389,7 +1448,7 @@ quick_commands:
     command: df -h /
   update:
     type: exec
-    command: cd ~/.hermes/hermes-agent && git pull && pip install -e .
+    command: cd ~/.hermes/hermes-agent && git pull && uv pip install -e .
   gpu:
     type: exec
     command: nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader

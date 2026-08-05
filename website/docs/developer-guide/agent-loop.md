@@ -65,12 +65,12 @@ run_conversation()
   1. Generate task_id if not provided
   2. Append user message to conversation history
   3. Build or reuse cached system prompt (prompt_builder.py)
-  4. Check if preflight compression is needed (>50% context)
+  4. Check whether prompt tokens reached the effective compression boundary
   5. Build API messages from conversation history
      - chat_completions: OpenAI format as-is
      - codex_responses: convert to Responses API input items
      - anthropic_messages: convert via anthropic_adapter.py
-  6. Inject ephemeral prompt layers (budget warnings, context pressure)
+  6. Inject applicable ephemeral prompt layers
   7. Apply prompt caching markers if on Anthropic
   8. Make interruptible API call (_interruptible_api_call)
   9. Parse response:
@@ -181,7 +181,7 @@ These tools modify agent state directly and return synthetic tool results withou
 
 The agent tracks iterations via `IterationBudget`:
 
-- Default: 90 iterations (configurable via `agent.max_turns`)
+- Default: 500 iterations (configurable via `agent.max_turns`)
 - Each agent gets its own budget. Subagents get independent budgets capped at `delegation.max_iterations` (default 50) — total iterations across parent + subagents can exceed the parent's cap
 - At 100%, the agent stops and returns a summary of work done
 
@@ -200,8 +200,14 @@ The fallback system also covers auxiliary tasks independently — vision, compre
 
 ### When Compression Triggers
 
-- **Preflight** (before API call): If conversation exceeds 50% of model's context window
-- **Gateway auto-compression**: If conversation exceeds 85% (more aggressive, runs between turns)
+- **Preflight** (before an API call): When prompt tokens reach the effective
+  boundary composed from the raw `compression.threshold` (`0.50` by default),
+  route/model and user policy, the small-window floor, output reservation,
+  guards and safety correction, and any positive `threshold_tokens` cap
+- **Gateway pre-agent hygiene** (between turns): Inherits that complete
+  effective policy by default. A valid `compression.hygiene_threshold` strictly
+  inside `(0, 1)` overrides percentage selection only; missing or invalid values
+  inherit the policy, and changes reload for each inbound message
 
 ### What Happens During Compression
 
@@ -209,7 +215,11 @@ The fallback system also covers auxiliary tasks independently — vision, compre
 2. Middle conversation turns are summarized into a compact summary
 3. The last N messages are preserved intact (`compression.protect_last_n`, default: 20)
 4. Tool call/result message pairs are kept together (never split)
-5. A new session lineage ID is generated (compression creates a "child" session)
+5. With the default `compression.in_place: true`, replaced turns are
+   soft-archived as inactive/compacted rows under the same session ID and remain
+   searchable and recoverable. Setting `in_place: false` enables legacy child
+   rotation for normal/manual in-agent compaction; gateway hygiene always
+   forces in-place operation for routing safety
 
 ### Session Persistence
 

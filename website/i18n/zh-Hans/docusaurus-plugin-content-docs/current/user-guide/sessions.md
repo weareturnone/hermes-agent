@@ -22,7 +22,7 @@ SQLite 数据库存储：
 - 完整消息历史（角色、内容、工具调用、工具结果）
 - Token 计数（输入/输出）
 - 时间戳（started_at、ended_at）
-- 父 session ID（用于压缩触发的 session 分割）
+- 父 session ID（用于已存储血缘和旧式选择退出压缩旋转）
 
 ### 哪些内容计入上下文
 
@@ -216,15 +216,17 @@ hermes sessions rename 20250305_091523_a1b2c3d4 "refactoring auth module"
 - **净化处理**——控制字符、零宽字符和 RTL 覆盖字符会被自动去除
 - **普通 Unicode 均可**——emoji、CJK 字符、带重音字符均支持
 
-### 压缩时的自动谱系
+### 稳定压缩身份与可选旧式谱系
 
-当 session 的上下文被压缩（通过 `/compress` 手动或自动触发）时，Hermes 会创建一个新的续接 session。如果原 session 有标题，新 session 会自动获得带编号的标题：
+默认 `compression.in_place: true` 使自动或手动压缩保留同一 session ID。被替换的轮次会以 inactive/compacted 行软归档在该 ID 下，因此仍可搜索、可恢复，而非被删除。
+
+将 `compression.in_place` 设为 `false` 可为普通或手动的 agent 内压缩启用旧式续接路径。该路径创建通过 `parent_session_id` 链接的子 session；如果原 session 有标题，子 session 会获得带编号的标题：
 
 ```
 "my project" → "my project #2" → "my project #3"
 ```
 
-按名称恢复时（`hermes -c "my project"`），会自动选取谱系中最新的 session。
+按名称恢复时（`hermes -c "my project"`），Hermes 会自动选取该已存储谱系中最新的 session。Gateway agent 前清理不受该偏好影响；它为路由安全始终原地压缩，不会创建续接子 session。
 
 ### 在消息平台中使用 /title
 
@@ -353,7 +355,7 @@ Trace 导出默认强制脱敏（它们本来就是要离开本机的）；`--no
 # 将单个 session 导出为 Markdown
 hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4
 
-# 将压缩链（compression lineage）导出为一个逻辑文档
+# 将已存储/旧式压缩链（compression lineage）导出为一个逻辑文档
 hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4 --lineage logical
 
 # 预览 90 天前已结束的 session，不写入文件
@@ -579,7 +581,7 @@ state.db 后可安全删除。
 - Gateway session 根据配置的重置策略自动重置
 - 重置前，agent 保存即将过期 session 中的记忆和技能
 - 可选自动清理：当 `sessions.auto_prune` 为 `true` 时，在 CLI/gateway 启动时清理早于 `sessions.retention_days`（默认 90）天的已结束 session
-- 实际删除了行的清理操作完成后，`state.db` 会执行 `VACUUM` 以回收磁盘空间（SQLite 在普通 DELETE 后不会缩小文件）
+- 实际删除了行的清理操作完成后，如果距离上次成功执行 `VACUUM` 已达到 `sessions.min_vacuum_interval_days`（默认 30）天，`state.db` 会执行 `VACUUM` 以回收磁盘空间（SQLite 在普通 DELETE 后不会缩小文件）
 - 清理最多每 `sessions.min_interval_hours`（默认 24）小时运行一次；上次运行时间戳记录在 `state.db` 内部，因此在同一 `HERMES_HOME` 下的所有 Hermes 进程间共享
 
 默认为**关闭**——session 历史对 `session_search` 召回很有价值，静默删除可能会让用户感到意外。在 `~/.hermes/config.yaml` 中启用：
@@ -589,6 +591,7 @@ sessions:
   auto_prune: true          # 选择启用——默认为 false
   retention_days: 90        # 保留已结束 session 的天数
   vacuum_after_prune: true  # 清理后回收磁盘空间
+  min_vacuum_interval_days: 30 # 数据库重写的最短间隔天数
   min_interval_hours: 24    # 清理间隔不短于此值
 ```
 

@@ -38,35 +38,33 @@ context:
 
 关于构建上下文引擎插件，请参阅 [Context Engine 插件](/developer-guide/context-engine-plugin)。
 
-## 双重压缩系统
+## 协同压缩检查点
 
-Hermes 有两个独立运行的压缩层：
+Gateway 和 agent 的两个检查点默认使用同一个有效压缩边界：
 
 ```
                      ┌──────────────────────────┐
-  Incoming message   │   Gateway Session Hygiene │  Fires at 85% of context
-  ─────────────────► │   (pre-agent, rough est.) │  Safety net for large sessions
+  Incoming message   │ Gateway Session Hygiene  │  Effective agent policy
+  ─────────────────► │ (pre-agent checkpoint)   │  Actual or estimated tokens
                      └─────────────┬────────────┘
                                    │
                                    ▼
                      ┌──────────────────────────┐
-                     │   Agent ContextCompressor │  Fires at 50% of context (default)
-                     │   (in-loop, real tokens)  │  Normal context management
+                     │ Agent ContextCompressor  │  Same boundary resolution
+                     │ (in-loop checkpoint)     │  API-reported tokens
                      └──────────────────────────┘
 ```
 
-### 1. Gateway 会话清理（85% 阈值）
+### 1. Gateway 会话清理（agent 前）
 
 位于 `gateway/run.py`（搜索 `Session hygiene: auto-compress`）。这是一个**安全网**，在 agent 处理消息之前运行。它防止会话在两次交互之间增长过大时（例如 Telegram/Discord 中的隔夜积累）导致 API 失败。
 
-- **阈值**：固定为模型上下文长度的 85%
+- **阈值**：当 `compression.hygiene_threshold` 缺失或为 `null` 时，继承完整的 agent 有效压缩策略；有效的显式值只覆盖百分比选择阶段
 - **Token 来源**：优先使用上一轮 API 实际报告的 token 数；回退到基于字符的粗略估算（`estimate_messages_tokens_rough`）
 - **触发条件**：仅当 `len(history) >= 4` 且压缩已启用时
-- **目的**：捕获逃过 agent 自身压缩器的会话
+- **目的**：在 agent 启动前应用有效边界，包括捕获逃过循环内压缩的会话
 
-Gateway 清理阈值有意高于 agent 压缩器的阈值。将其设置为 50%（与 agent 相同）会导致长 gateway 会话在每一轮都过早触发压缩。
-
-### 2. Agent ContextCompressor（50% 阈值，可配置）
+### 2. Agent ContextCompressor（循环内）
 
 位于 `agent/context_compressor.py`。这是**主要压缩系统**，在 agent 的工具循环内运行，可访问准确的 API 报告 token 数。
 
@@ -78,9 +76,14 @@ Gateway 清理阈值有意高于 agent 压缩器的阈值。将其设置为 50%�
 ```yaml
 compression:
   enabled: true              # Enable/disable compression (default: true)
-  threshold: 0.50            # Fraction of context window (default: 0.50 = 50%)
+  progress_notices: false    # Opt in to routine gateway compression statuses
+  threshold: 0.50            # Raw global percentage before policy composition
+  threshold_tokens: null     # Optional absolute token cap on the effective boundary
+  hygiene_threshold: null    # Gateway inherits the complete agent policy (default)
+  # hygiene_threshold: "0.80"  # Explicit gateway percentage override
   target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
   protect_last_n: 20         # Minimum protected tail messages (default: 20)
+  in_place: true             # Compact on the same session id (default: true)
 
 # Summarization model/provider configured under auxiliary:
 auxiliary:
@@ -94,17 +97,36 @@ auxiliary:
 
 | 参数 | 默认值 | 范围 | 描述 |
 |-----------|---------|-------|-------------|
-| `threshold` | `0.50` | 0.0-1.0 | 当 prompt token 数 ≥ `threshold × context_length` 时触发压缩 |
+| `progress_notices` | `false` | bool | 是否在聊天 gateway 显示常规压缩开始、preflight/pre-API、空闲恢复、重试和完成状态；失败通知和手动 `/compress` 反馈始终可见 |
+| `threshold` | `0.50` | 0.0-1.0 | 用于计算有效边界的起始原始全局百分比 |
+| `threshold_tokens` | `null` | 正整数或 `null` | 可选绝对 token 上限；它与解析后百分比边界中较低者生效 |
+| `hygiene_threshold` | `null` | 严格位于 `(0, 1)` 内的有限数值，或 `null` | Gateway 专用百分比覆盖；`null` 或无效值继承完整的 agent 有效策略 |
 | `target_ratio` | `0.20` | 0.10-0.80 | 控制尾部保护 token 预算：`threshold_tokens × target_ratio` |
 | `protect_last_n` | `20` | ≥1 | 始终保留的最近消息最小数量 |
 | `protect_first_n` | `3` | （硬编码）| 系统提示词 + 首次交互始终保留 |
+| `in_place` | `true` | bool | 在同一 session ID 上压缩，而不是旋转到新 session |
+
+### Gateway 清理策略与覆盖
+
+`compression.hygiene_threshold` 缺失或为 `null` 时，Gateway 清理继承完整的 agent 有效策略。百分比选择从全局 `threshold` 开始，依次应用内置路由/模型策略和最长匹配的用户 `model_thresholds`。计算 token 边界时还会组合：小于 512K 窗口的只升不降 75% 下限、输出 token 预留、64K 最小窗口保护、使边界严格低于有效窗口的安全校正，以及最后应用的可选正数 `threshold_tokens` 上限。因此，原始默认 `threshold: 0.50` 不是所有模型的固定实际触发点。
+
+有效的显式 `hygiene_threshold` 只替换百分比选择阶段，上述窗口下限、预留、保护、安全校正和 token 上限仍然应用。YAML 数值和引号包围的数字字符串均可接受，结果必须是严格位于 `(0, 1)` 内的有限数。缺失、非数字、`NaN`/无穷大、布尔值、0 或 1、超范围值、列表和映射都安全回退到完整继承策略，且不会重写 `config.yaml`。
+
+Gateway 会在每条入站消息时重新加载该设置。因此，`null` → 显式值 → `null` 会从各自的下一条消息起生效，无需重启 Gateway。
+
+### 原地压缩（单一稳定 session ID）
+
+`compression.in_place: true`（默认）会在同一 session ID 上重写实时消息列表。被替换的压缩前轮次会以 `active=0, compacted=1` 在同一 ID 下软归档；它们仍可搜索、可恢复，不会被删除。该默认路径不创建 `parent_session_id` 链，也不会将名称重编号为 `name #N`。
+
+将 `in_place` 设为 `false` 只会对普通或手动的 agent 内压缩恢复旧式旋转路径：新 session 通过 `parent_session_id` 链接到旧 session。Gateway 的 agent 前清理是例外；为保证路由安全，它始终强制原地压缩，不会发布续接子 session。
 
 ### 计算值（200K 上下文模型，默认参数）
 
 ```
 context_length       = 200,000
-threshold_tokens     = 200,000 × 0.50 = 100,000
-tail_token_budget    = 100,000 × 0.20 = 20,000
+selected_percentage  = max(0.50, 0.75 small-window floor) = 0.75
+effective_boundary   = 200,000 × 0.75 = 150,000
+tail_token_budget    = 150,000 × 0.20 = 30,000
 max_summary_tokens   = min(200,000 × 0.05, 12,000) = 10,000
 ```
 
@@ -323,4 +345,6 @@ CLI 在启动时显示缓存状态：
 
 ## 上下文压力警告
 
-中间上下文压力警告已被移除（参见 `run_agent.py` 中的迭代预算块，其中注明："No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"）。压缩在 prompt token 达到配置的 `compression.threshold`（默认 50%）时触发，无需事先警告步骤；gateway 会话清理作为二级安全网在模型上下文窗口的 85% 处触发。
+固定百分比的中间上下文压力警告已被移除（参见 `run_agent.py` 中的迭代预算块，其中注明："No intermediate pressure warnings — they caused models to 'give up' prematurely on complex tasks"）。当 prompt token 达到有效压缩边界时会直接压缩，不存在固定的 60% 或 85% 警告条阶段。Gateway 会话清理默认应用同一有效策略，或使用上文所述的有效 `compression.hygiene_threshold` 覆盖。
+
+在聊天 gateway 上，`compression.progress_notices: false` 默认使常规压缩进度保持静默。设为 `true` 后会显示实际的开始、preflight/pre-API、空闲恢复、重试和完成生命周期状态。压缩失败和手动 `/compress` 反馈不受该设置影响，始终可见。
